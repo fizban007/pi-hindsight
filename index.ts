@@ -29,6 +29,81 @@ function log(msg: string) {
 }
 
 // ---------------------------------------------------------------------------
+// Extension liveness
+// ---------------------------------------------------------------------------
+// Pi invalidates an extension runtime when its session is replaced (newSession,
+// fork, switchSession) or when the process tears down — /reload, /exit, and
+// one-shot `pi -p` runs (subagents, scripts) all end this way. Every runtime
+// method asserts liveness and then throws, so work that resolves after that
+// point cannot paint UI or send messages: there is no session left to paint on.
+//
+// Probe instead of catching, so a late retain report is dropped quietly rather
+// than crashing the shutdown path with a stale-ctx error.
+function extensionIsLive(pi: any): boolean {
+  try {
+    if (typeof pi.getActiveTools !== "function") return true;
+    pi.getActiveTools();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Paint the outcome of a retain (status badge and/or next-turn message).
+// Shared by the async and sync paths so both report identically.
+function emitRetainReport(
+  pi: any,
+  ctx: any,
+  outcome: {
+    succeededBanks: string[];
+    allFailed: boolean;
+    sessionId: string | null;
+    retainSuccessCount: number;
+    retainEligibleCount: number;
+  }
+) {
+  if (!extensionIsLive(pi)) {
+    log(
+      `agent_settled: retain report dropped - extension runtime gone (session ${outcome.sessionId ?? "unknown"}), retain itself already committed`
+    );
+    return;
+  }
+
+  const config = getConfig();
+  const feedback = config?.retain_feedback;
+  const showMessage = feedback === "message" || feedback === "both";
+  const showStatus = feedback === "status" || feedback === "both" || !feedback;
+  const badge = `Memorized: ${outcome.retainSuccessCount}/${outcome.retainEligibleCount}`;
+
+  try {
+    if (outcome.allFailed) {
+      if (showStatus) ctx.ui.setStatus("hindsight", badge);
+      pi.sendMessage(
+        { customType: "hindsight-retain-failed", content: "", display: true },
+        { deliverAs: "nextTurn" }
+      );
+      return;
+    }
+
+    ctx.ui.setStatus("hindsight", showStatus ? badge : undefined);
+    if (showMessage) {
+      pi.sendMessage(
+        {
+          customType: "hindsight-retain",
+          content: "",
+          display: true,
+          details: { banks: outcome.succeededBanks },
+        },
+        { deliverAs: "nextTurn" }
+      );
+    }
+  } catch (e) {
+    const detail = e instanceof Error ? e.message.slice(0, 80) : String(e);
+    log(`agent_settled: retain report skipped (${detail})`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Config & Helpers
 // ---------------------------------------------------------------------------
 
@@ -717,6 +792,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
   let retainSuccessCount = 0;
   let retainEligibleCount = 0;
   let currentPrompt = "";
+  let lastRunMessages: any[] = [];
 
   // Track user input for fallback
   pi.on("input", async (event: any) => {
@@ -734,6 +810,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
     hookStats.retain = {};
     retainSuccessCount = 0;
     retainEligibleCount = 0;
+    lastRunMessages = [];
     ctx.ui.setStatus("hindsight", undefined);
     log("session_start: state reset");
     const config = getConfig();
@@ -782,6 +859,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
     recallAttempts = 0;
     retainSuccessCount = 0;
     retainEligibleCount = 0;
+    lastRunMessages = [];
     ctx.ui.setStatus("hindsight", undefined);
     log("session_compact: state reset");
   });
@@ -1105,43 +1183,59 @@ export default function hindsightExtension(pi: ExtensionAPI) {
   });
 
   // -----------------------------------------------------------------------
-  // Auto-Retain (agent_end)
+  // Auto-Retain (agent_settled)
   // -----------------------------------------------------------------------
-  pi.on("agent_end", async (event: any, ctx) => {
-    log("agent_end: fired");
+  // `agent_end` closes one low-level run; retries, overflow recovery, compaction
+  // retry, steering, and queued follow-ups can still continue it, so retaining
+  // there can capture half a conversation and can fire twice for one settle.
+  // Stash the run's messages on agent_end and do the work once Pi has no
+  // automatic continuation left.
+  pi.on("agent_end", async (event: any) => {
+    lastRunMessages = event.messages || [];
+  });
+
+  // The pinned dev types (@mariozechner/pi-coding-agent 0.66) predate
+  // `agent_settled`; the running pi (1.4+) emits it. Runtime alias maps both
+  // package names onto the same module, so only the build-time type needs a cast.
+  (pi as any).on("agent_settled", async (event: any, ctx: any) => {
+    log("agent_settled: fired");
     const config = getConfig();
     if (!config || !config.api_url) {
-      log("agent_end: no config, skipping");
+      log("agent_settled: no config, skipping");
       return;
     }
 
     if (config.retain_enabled === false) {
-      log("agent_end: retain disabled by config");
+      log("agent_settled: retain disabled by config");
       return;
     }
 
     const lastUserPrompt = getLastUserMessage(ctx, currentPrompt);
     const sessionId = ctx.sessionManager?.getSessionId?.() || currentSessionId;
     if (!lastUserPrompt) {
-      log("agent_end: no user prompt found, skipping");
+      log("agent_settled: no user prompt found, skipping");
       return;
     }
 
     // Skip trivial interactions
     if (lastUserPrompt.length < 5 || /^(ok|yes|no|thanks|continue|next|done|sure|stop)$/i.test(lastUserPrompt.trim())) {
-      log(`agent_end: trivial prompt, skipping retain`);
+      log(`agent_settled: trivial prompt, skipping retain`);
       return;
     }
 
     // Opt-out mechanism
     if (lastUserPrompt.trim().startsWith("#nomem") || lastUserPrompt.trim().startsWith("#skip")) {
-      log("agent_end: opt-out tag, skipping retain");
+      log("agent_settled: opt-out tag, skipping retain");
       return;
     }
 
     let transcript = `[role: user]\n${lastUserPrompt}\n[user:end]\n\n[role: assistant]\n`;
 
-    const messages = event.messages || [];
+    const messages = lastRunMessages;
+    if (!messages.some((msg: any) => msg.role === "assistant")) {
+      log("agent_settled: no assistant output in the run, skipping retain");
+      return;
+    }
     for (const msg of messages) {
       if (msg.role !== "assistant") continue;
 
@@ -1189,7 +1283,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
 
     // Async retain: fire and forget, don't block
     if (config.async_retain !== false) {
-      log("agent_end: async retain fired (not awaiting)");
+      log("agent_settled: async retain fired (not awaiting)");
       const retainPromise = Promise.allSettled(
         banks.map(async (bank) => {
           const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories`, {
@@ -1210,13 +1304,12 @@ export default function hindsightExtension(pi: ExtensionAPI) {
               async: true
             })
           });
-          log(`agent_end: bank=${bank} retain HTTP ${res.status}`);
+          log(`agent_settled: bank=${bank} retain HTTP ${res.status}`);
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
           return bank;
         })
       );
       retainPromise.then((results) => {
-        try {
         const succeededBanks = results
           .filter(r => r.status === "fulfilled")
           .map(r => (r as PromiseFulfilledResult<string>).value);
@@ -1227,42 +1320,25 @@ export default function hindsightExtension(pi: ExtensionAPI) {
           detail: allFailed ? "all banks unreachable" : succeededBanks.join(", "),
         };
         if (!allFailed) retainSuccessCount++;
-        const showMessage = config.retain_feedback === "message" || config.retain_feedback === "both";
-        const showStatus = config.retain_feedback === "status" || config.retain_feedback === "both" || !config.retain_feedback;
         if (allFailed) {
-          log("agent_end: async retain - all banks failed");
-          pi.sendMessage(
-            { customType: "hindsight-retain-failed", content: "", display: true },
-            { deliverAs: "nextTurn" }
-          );
-          if (showStatus) {
-            ctx.ui.setStatus("hindsight", `Memorized: ${retainSuccessCount}/${retainEligibleCount}`);
-          }
+          log("agent_settled: async retain - all banks failed");
         } else {
-          log(`agent_end: async retain - succeeded banks=${succeededBanks.join(",")}`);
-          if (showStatus) {
-            ctx.ui.setStatus("hindsight", `Memorized: ${retainSuccessCount}/${retainEligibleCount}`);
-          }
-          if (showMessage) {
-            pi.sendMessage(
-              { customType: "hindsight-retain", content: "", display: true, details: { banks: succeededBanks } },
-              { deliverAs: "nextTurn" }
-            );
-          }
+          log(`agent_settled: async retain - succeeded banks=${succeededBanks.join(",")}`);
         }
-        } catch (e) {
-          // The turn's ctx is torn down before this callback runs (session
-          // replacement/reload/compaction), so post-retain UI updates can throw.
-          // The retain itself already succeeded; never let the report kill the run.
-          log(`agent_end: post-retain update skipped (ctx stale): ${e}`);
-        }
+        emitRetainReport(pi, ctx, {
+          succeededBanks,
+          allFailed,
+          sessionId,
+          retainSuccessCount,
+          retainEligibleCount,
+        });
       });
       return;
     }
 
     // Sync retain (original behavior)
     try {
-      log(`agent_end: retaining to banks=${banks.join(",")} transcript_len=${transcript.length} tags=${extractedTags.join(",")}`);
+      log(`agent_settled: retaining to banks=${banks.join(",")} transcript_len=${transcript.length} tags=${extractedTags.join(",")}`);
 
       const results = await Promise.allSettled(
         banks.map(async (bank) => {
@@ -1284,7 +1360,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
               async: true
             })
           });
-          log(`agent_end: bank=${bank} retain HTTP ${res.status}`);
+          log(`agent_settled: bank=${bank} retain HTTP ${res.status}`);
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
           return bank;
         })
@@ -1300,41 +1376,18 @@ export default function hindsightExtension(pi: ExtensionAPI) {
         detail: allFailed ? "all banks unreachable" : succeededBanks.join(", "),
       };
       if (!allFailed) retainSuccessCount++;
-      const showMessage = config.retain_feedback === "message" || config.retain_feedback === "both";
-      const showStatus = config.retain_feedback === "status" || config.retain_feedback === "both" || !config.retain_feedback;
       if (allFailed) {
-        log("agent_end: all banks failed - sending next-turn notification");
-        if (showStatus) {
-          ctx.ui.setStatus("hindsight", `Memorized: ${retainSuccessCount}/${retainEligibleCount}`);
-        }
-        pi.sendMessage(
-          {
-            customType: "hindsight-retain-failed",
-            content: "",
-            display: true,
-          },
-          { deliverAs: "nextTurn" }
-        );
-      } else {
-        if (showStatus) {
-          ctx.ui.setStatus("hindsight", `Memorized: ${retainSuccessCount}/${retainEligibleCount}`);
-        } else {
-          ctx.ui.setStatus("hindsight", undefined);
-        }
-        if (showMessage) {
-          pi.sendMessage(
-            {
-              customType: "hindsight-retain",
-              content: "",
-              display: true,
-              details: { banks: succeededBanks },
-            },
-            { deliverAs: "nextTurn" }
-          );
-        }
+        log("agent_settled: all banks failed - sending next-turn notification");
       }
+      emitRetainReport(pi, ctx, {
+        succeededBanks,
+        allFailed,
+        sessionId,
+        retainSuccessCount,
+        retainEligibleCount,
+      });
     } catch (e) {
-      log(`agent_end: error ${e}`);
+      log(`agent_settled: error ${e}`);
     }
   });
 

@@ -13,13 +13,15 @@ import assert from "node:assert/strict";
 // Minimal Pi API mock
 // ---------------------------------------------------------------------------
 
-type HookName = "session_start" | "session_compact" | "before_agent_start" | "agent_end" | "input";
+type HookName = "session_start" | "session_compact" | "before_agent_start" | "agent_end" | "agent_settled" | "input";
 type HookHandler = (event: any, ctx: any) => Promise<any>;
 
 function makePiMock() {
   const handlers: Record<string, HookHandler[]> = {};
   const tools: Record<string, any> = {};
   const commands: Record<string, any> = {};
+  const sentMessages: { message: any; options: any }[] = [];
+  let stale = false;
 
   return {
     on(event: HookName, handler: HookHandler) {
@@ -33,7 +35,24 @@ function makePiMock() {
       commands[name] = spec;
     },
     registerMessageRenderer(_type: string, _renderer: any) {},
+    // Mirrors the real runtime: every method asserts liveness and throws once
+    // the extension runtime has been invalidated (session replacement/shutdown).
+    getActiveTools(): string[] {
+      if (stale) throw new Error("This extension ctx is stale after session replacement or reload.");
+      return [];
+    },
+    sendMessage(message: any, options: any) {
+      if (stale) throw new Error("This extension ctx is stale after session replacement or reload.");
+      sentMessages.push({ message, options });
+    },
     // Test helpers
+    invalidate() {
+      stale = true;
+    },
+    isStale() {
+      return stale;
+    },
+    sentMessages,
     async emit(event: HookName, eventData: any = {}, ctx: any = {}) {
       const list = handlers[event] || [];
       let result: any;
@@ -1711,6 +1730,7 @@ describe("hook-level session isolation", { skip: !extensionDepsInstalled && "ext
     await pi.emit("session_start", {}, ctx);
     const before = recorded.length;
     await pi.emit("agent_end", { messages: [{ role: "assistant", content: "here is the answer" }] }, ctx);
+    await pi.emit("agent_settled", { aborted: false }, ctx);
     return recorded
       .slice(before)
       .filter(r => r.method === "POST" && r.url.includes("/memories"));
@@ -1813,5 +1833,144 @@ describe("hook-level session isolation", { skip: !extensionDepsInstalled && "ext
     await pi.emit("session_start", {}, makeSessionCtx(SID_A, ""));
     const missionCalls = recorded.filter(r => r.url.includes("/profile") || r.url.includes("/config"));
     assert.equal(missionCalls.length, 0, "should not provision missions for ephemeral session banks");
+  });
+
+  test("retains once per settle, from the final run's messages", async () => {
+    const pi = makePiMock();
+    hindsightExtension(pi);
+    const ctx = makeSessionCtx(SID_A, "please refactor the parser");
+    await pi.emit("session_start", {}, ctx);
+    const before = recorded.length;
+    const retainsSince = () =>
+      recorded.slice(before).filter(r => r.method === "POST" && r.url.includes("/memories"));
+
+    // Two low-level runs (e.g. a retry) before the run settles.
+    await pi.emit("agent_end", { messages: [{ role: "assistant", content: "first partial attempt" }] }, ctx);
+    await pi.emit("agent_end", { messages: [{ role: "assistant", content: "the real answer" }] }, ctx);
+    assert.equal(retainsSince().length, 0, "agent_end alone must not retain mid-run");
+
+    await pi.emit("agent_settled", { aborted: false }, ctx);
+    const retains = retainsSince();
+    assert.equal(retains.length, 1, "exactly one retain per settle");
+    const content = retains[0].body.items[0].content;
+    assert.ok(content.includes("the real answer"), `transcript should carry the final run: ${content}`);
+    assert.ok(!content.includes("first partial attempt"), "earlier run must not leak into the transcript");
+  });
+
+  test("does not retain a settled run with no assistant output", async () => {
+    const pi = makePiMock();
+    hindsightExtension(pi);
+    const ctx = makeSessionCtx(SID_A, "please refactor the parser");
+    await pi.emit("session_start", {}, ctx);
+    const before = recorded.length;
+    await pi.emit("agent_settled", { aborted: true }, ctx);
+    const retains = recorded.slice(before).filter(r => r.method === "POST" && r.url.includes("/memories"));
+    assert.equal(retains.length, 0, "nothing to remember without an assistant reply");
+  });
+});
+
+describe("retain report delivery", { skip: !extensionDepsInstalled && "extension deps not installed (run npm ci)" }, () => {
+  const SID = "01a18ab7-1111-7222-8333-444455556666";
+  const CWD = "/work/proj";
+
+  let hindsightExtension: any;
+  let fakeHome: string;
+  let originalHome: string | undefined;
+  let realFetch: any;
+
+  // ctx.ui and the pi runtime both assert liveness in real Pi: once the session
+  // is replaced or the process tears down, every call throws.
+  function makeSessionCtx(pi: any, statuses: string[]) {
+    return {
+      cwd: CWD,
+      sessionManager: {
+        getSessionId: () => SID,
+        getEntries: () => [
+          { type: "message", message: { role: "user", content: "please refactor the parser module" } },
+        ],
+      },
+      ui: {
+        setStatus(_key: string, value?: string) {
+          if (pi.isStale()) throw new Error("This extension ctx is stale after session replacement or reload.");
+          if (value) statuses.push(value);
+        },
+        notify() {},
+      },
+    };
+  }
+
+  before(async () => {
+    originalHome = process.env.HOME;
+    fakeHome = mkdtempSync(pathJoin(tmpdir(), "hindsight-report-test-"));
+    mkdirSync(pathJoin(fakeHome, ".hindsight"), { recursive: true });
+    writeFileSync(
+      pathJoin(fakeHome, ".hindsight", "config"),
+      ['api_url = "http://fake-hindsight"', 'api_key = "test-key"', 'bank_scope = "session"', 'bank_namespace = "testbox"', 'async_retain = "true"'].join("\n") + "\n"
+    );
+    process.env.HOME = fakeHome;
+    realFetch = (global as any).fetch;
+    ({ default: hindsightExtension } = await import("./index.ts"));
+  });
+
+  after(() => {
+    process.env.HOME = originalHome;
+    (global as any).fetch = realFetch;
+    rmSync(fakeHome, { recursive: true, force: true });
+  });
+
+  async function runAsyncTurn(pi: any, ctx: any, retainOk: boolean) {
+    (global as any).fetch = async () =>
+      retainOk
+        ? { ok: true, status: 200, json: async () => ({ results: [] }) }
+        : { ok: false, status: 500, json: async () => ({}) };
+    await pi.emit("session_start", {}, ctx);
+    await pi.emit("agent_end", { messages: [{ role: "assistant", content: "here is the answer" }] }, ctx);
+    await pi.emit("agent_settled", { aborted: false }, ctx);
+    // Let the fire-and-forget retain promise settle.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+
+  test("async retain paints the badge while the session is alive", async () => {
+    const statuses: string[] = [];
+    const pi = makePiMock();
+    hindsightExtension(pi);
+    await runAsyncTurn(pi, makeSessionCtx(pi, statuses), true);
+
+    assert.deepEqual(statuses, ["Memorized: 1/1"]);
+    assert.equal(pi.sentMessages.length, 0, "default feedback is status only");
+  });
+
+  test("a retain that lands after teardown drops the report instead of throwing", async () => {
+    const statuses: string[] = [];
+    const pi = makePiMock();
+    hindsightExtension(pi);
+    const ctx = makeSessionCtx(pi, statuses);
+
+    const calls: string[] = [];
+    (global as any).fetch = async (url: any, opts: any = {}) => {
+      calls.push(`${opts.method || "GET"} ${String(url)}`);
+      return { ok: true, status: 200, json: async () => ({ results: [] }) };
+    };
+    await pi.emit("session_start", {}, ctx);
+    await pi.emit("agent_end", { messages: [{ role: "assistant", content: "here is the answer" }] }, ctx);
+    await pi.emit("agent_settled", { aborted: false }, ctx);
+    pi.invalidate(); // process teardown / session replacement wins the race
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const retains = calls.filter(c => c.startsWith("POST") && c.includes("/memories"));
+    assert.equal(retains.length, 1, "the retain itself must still be attempted");
+    assert.deepEqual(statuses, [], "no badge can be painted without a live session");
+  });
+
+  test("a failed async retain reports through the next-turn message", async () => {
+    const statuses: string[] = [];
+    const pi = makePiMock();
+    hindsightExtension(pi);
+    await runAsyncTurn(pi, makeSessionCtx(pi, statuses), false);
+
+    assert.deepEqual(statuses, ["Memorized: 0/1"]);
+    assert.equal(pi.sentMessages.length, 1);
+    assert.equal(pi.sentMessages[0].message.customType, "hindsight-retain-failed");
+    assert.equal(pi.sentMessages[0].options.deliverAs, "nextTurn");
   });
 });

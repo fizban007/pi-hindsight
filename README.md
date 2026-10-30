@@ -174,7 +174,7 @@ Banks can also be steered from the environment, using the same variables omp rea
 | `HINDSIGHT_BANK_NAMESPACE` | Overrides `bank_namespace`. |
 | `HINDSIGHT_SCOPING=global` | Additionally replaces `global_bank` with `HINDSIGHT_BANK_ID`, collapsing recall + retain into one flat bank per agent (same semantics as omp's `global` scoping). Also pins the exact bank, disabling session scope. |
 | `HINDSIGHT_SCOPING=per-project` / `per-project-tagged` | Pins project scoping; the configured `global_bank` stays in the recall mix. pi-hindsight has no tag-scoped scoping, so omp's per-project-tagged behavior (same bank with project tags) is approximated, not replicated. |
-| `HINDSIGHT_RETAIN_EVERY_N_TURNS` | Ignored — omp-only. Retention runs at `agent_end` on every turn. |
+| `HINDSIGHT_RETAIN_EVERY_N_TURNS` | Ignored — omp-only. Retention runs at `agent_settled` on every settled turn. |
 
 Precedence: environment > project config > global config > `project-<dirname>` default. Without `HINDSIGHT_BANK_ID` the environment still applies `HINDSIGHT_BANK_SCOPE` / `HINDSIGHT_BANK_NAMESPACE`; other config-driven setups are unaffected. `HINDSIGHT_DEBUG=1` turns on debug logging (see below).
 
@@ -304,7 +304,7 @@ This section aims to help you pick the right one. Both are good.
 
 | Dimension | **pi-hindsight** | **@walodayeet/hindsight-pi** |
 |---|---|---|
-| Trigger | `agent_end`, async by default | `agent_end` |
+| Trigger | `agent_settled`, async by default | `agent_end` |
 | Write scheduling | Immediate (async fire-and-forget) or sync | `turn`, `async`, `session`, or N-turn batch |
 | Retain modes | Full transcript, append mode | `response`, `step-batch`, `both`, or `off` |
 | Content retained | User + assistant + non-operational tool calls | User + assistant text (turn summary) |

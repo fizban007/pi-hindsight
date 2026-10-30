@@ -5,7 +5,7 @@
 ### Ours
 
 - Recall: `before_agent_start`, blocking, no timeout
-- Retain: `agent_end`, async with `Promise.allSettled`
+- Retain: `agent_settled` (messages stashed on `agent_end`), async with `Promise.allSettled`
 - Tools: `hindsight_recall`, `hindsight_retain`, `hindsight_reflect`
 - Commands: `/hindsight [status|stats|config]`
 - Config: `.ini` format (`~/.hindsight/config`)
