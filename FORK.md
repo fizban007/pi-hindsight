@@ -8,14 +8,21 @@ other's turns. See the main README for the full behavior.
 `upstream` points at the original, so this fork can track it and send pull
 requests from here.
 
-## Replicate on another machine
+## Install on a machine
 
 ```bash
-git clone https://github.com/fizban007/pi-hindsight.git ~/Projects/pi-hindsight
-cd ~/Projects/pi-hindsight && npm ci && npm run build
-
 pi remove npm:pi-hindsight          # otherwise two copies load and double-retain
-pi install ~/Projects/pi-hindsight
+pi install git:github.com/fizban007/pi-hindsight
+```
+
+Pi clones the repo into its managed directory and installs dependencies; the
+host-provided packages come from Pi itself. No build step, no checkout to
+maintain.
+
+This tracks `main` and reconciles on `pi update --extensions`. To pin:
+
+```bash
+pi install git:github.com/fizban007/pi-hindsight@<commit-or-tag>
 ```
 
 Then in `~/.hindsight/config`:
@@ -34,6 +41,31 @@ session. Set it explicitly if the hostname is unstable:
 ```toml
 bank_namespace = "laptop"
 ```
+
+**Caveat:** a git install runs the `index.js` committed in the repo — Pi does
+not build it. Always `npm run build` before pushing (see below).
+
+## Develop on this fork
+
+Use a local checkout on the machine where you edit; local packages are not
+copied, so a rebuild is picked up immediately.
+
+```bash
+git clone https://github.com/fizban007/pi-hindsight.git ~/Projects/pi-hindsight
+cd ~/Projects/pi-hindsight && npm ci
+npm run build
+
+pi remove <whatever source `pi list` shows>   # avoid double-loading
+pi install ~/Projects/pi-hindsight
+```
+
+`index.js` is committed because git installs have no build step. The loop is:
+
+```bash
+npm run build && git add index.js && git commit -m "..." && git push
+```
+
+Tests: `npm test` (lifecycle + bank resolution) and `npx vitest run` (mission setup).
 
 ## Sync with upstream
 
