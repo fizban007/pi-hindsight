@@ -1,12 +1,12 @@
 # This fork
 
-Personal fork of [anh-chu/pi-hindsight](https://github.com/anh-chu/pi-hindsight).
+Public fork of [anh-chu/pi-hindsight](https://github.com/anh-chu/pi-hindsight).
 It adds session-scoped memory banks: with `bank_scope = "session"` every Pi
 session gets its own bank, so concurrent sessions can never recall each
 other's turns. See the main README for the full behavior.
 
-Not a GitHub fork on purpose — forks of public repositories cannot be private.
-`upstream` is kept as a remote so this can still track the original.
+`upstream` points at the original, so this fork can track it and send pull
+requests from here.
 
 ## Replicate on another machine
 
@@ -43,6 +43,9 @@ git fetch upstream
 git merge upstream/main
 npm ci && npm run build
 ```
+
+To offer a change upstream, push a branch here and open the pull request from
+this fork — same as any other GitHub fork.
 
 ## Housekeeping
 
