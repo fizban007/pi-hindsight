@@ -785,7 +785,7 @@ export default function hindsightExtension(pi) {
         description: "Recall relevant context, conventions, or past solutions from the team memory. Use this when the user explicitly asks you to search memory.",
         parameters: Type.Object({
             query: Type.String(),
-            bank: Type.Optional(Type.String({ description: "Search this exact bank instead of the current session bank (e.g. a project or global bank)" }))
+            bank: Type.Optional(Type.String({ description: "Search this exact bank instead of the banks recall reads by default (the current project and the global bank), e.g. another project's bank" }))
         }),
         async execute(_id, params, _signal, _onUpdate, ctx) {
             const { query, bank: explicitBank } = params;
