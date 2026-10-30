@@ -5,7 +5,7 @@
 import { Text } from "@mariozechner/pi-tui";
 import { existsSync, readFileSync, appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { join, basename } from "node:path";
-import { homedir } from "node:os";
+import { homedir, hostname } from "node:os";
 import { Type } from "@sinclair/typebox";
 // ---------------------------------------------------------------------------
 // Debug Logging
@@ -13,6 +13,7 @@ import { Type } from "@sinclair/typebox";
 const DEBUG = process.env.HINDSIGHT_DEBUG === "1";
 const LOG_PATH = join(homedir(), ".hindsight", "debug.log");
 let sessionCwd = process.cwd();
+let currentSessionId = null;
 function log(msg) {
     if (!DEBUG)
         return;
@@ -56,6 +57,9 @@ function getConfig() {
         const recall_enabled = merged.recall_enabled === "false" ? false : true;
         const retain_enabled = merged.retain_enabled === "false" ? false : true;
         const homedir_project = merged.homedir_project === "false" ? false : true;
+        const bank_scope = merged.bank_scope === "session" ? "session" : "project";
+        const bank_namespace = merged.bank_namespace !== undefined ? merged.bank_namespace : undefined;
+        const session_bank_ttl_days = merged.session_bank_ttl_days ? parseInt(merged.session_bank_ttl_days, 10) : undefined;
         return {
             api_url: merged.api_url,
             api_key: merged.api_key,
@@ -70,6 +74,9 @@ function getConfig() {
             recall_enabled,
             retain_enabled,
             homedir_project,
+            bank_scope,
+            bank_namespace,
+            session_bank_ttl_days,
         };
     }
     catch (e) {
@@ -172,23 +179,33 @@ function getConfigWithSource() {
 // (e.g. agent wrappers that already steer omp this way). Precedence:
 // environment > project config > global config > `project-<dirname>` default.
 //
-//   HINDSIGHT_BANK_ID           Replaces the project bank — the primary bank
-//                               for both recall and retain.
+//   HINDSIGHT_BANK_ID           Replaces the bank root. With
+//                               bank_scope=session it is the root that session
+//                               banks are derived from; with scope=project it
+//                               is the exact bank.
+//   HINDSIGHT_BANK_SCOPE        "session" or "project" — overrides bank_scope.
+//   HINDSIGHT_BANK_NAMESPACE    Overrides bank_namespace.
 //   HINDSIGHT_SCOPING=global    Additionally replaces global_bank with the same
 //                               id, collapsing recall + retain into one flat
-//                               bank per agent (omp's "global" scoping).
+//                               bank per agent (omp's "global" scoping). Also
+//                               pins the exact bank, disabling session scope.
 //   HINDSIGHT_SCOPING=per-project|per-project-tagged
-//                               Overrides the project bank only; the configured
-//                               global_bank stays in the recall mix. (pi-hindsight
-//                               has no tag-scoped scoping; see README.)
+//                               Pins project scoping; the configured
+//                               global_bank stays in the recall mix.
 //   Any other HINDSIGHT_SCOPING value is ignored.
 //
 // HINDSIGHT_RETAIN_EVERY_N_TURNS (omp) has no equivalent here: retain runs at
 // agent_end on every turn, so it is deliberately not read.
 //
-// Without HINDSIGHT_BANK_ID this is a no-op — config-driven setups are
-// unaffected.
+// Without HINDSIGHT_BANK_ID this only applies the scope/namespace overrides —
+// config-driven setups are otherwise unaffected.
 export function applyEnvOverrides(merged) {
+    const scope = process.env.HINDSIGHT_BANK_SCOPE?.trim();
+    if (scope === "session" || scope === "project")
+        merged.bank_scope = scope;
+    if (process.env.HINDSIGHT_BANK_NAMESPACE !== undefined) {
+        merged.bank_namespace = process.env.HINDSIGHT_BANK_NAMESPACE.trim();
+    }
     const bank = process.env.HINDSIGHT_BANK_ID?.trim();
     if (!bank)
         return;
@@ -198,17 +215,103 @@ export function applyEnvOverrides(merged) {
     merged.homedir_project = "true";
     if (scoping === "global") {
         merged.global_bank = "";
+        // An explicitly pinned bank has no session suffix — omp semantics.
+        merged.bank_scope = "project";
+    }
+    else if (scoping === "per-project" || scoping === "per-project-tagged") {
+        merged.bank_scope = "project";
     }
 }
-function getProjectBank(config) {
+// ---------------------------------------------------------------------------
+// Bank resolution
+// ---------------------------------------------------------------------------
+// A bank id is the unit of isolation: everything in one bank is recalled
+// together. With bank_scope=session every Pi session gets its own bank, so two
+// concurrent sessions can never read each other's turns.
+//
+// Session banks always carry a namespace — the machine identity, by default the
+// hostname. Without it, two machines that share a Hindsight server (and sync
+// ~/.pi, and therefore session ids) would derive the same bank id for the same
+// session and silently share memory. The `sess-` prefix marks banks this
+// extension owns, which is what makes /hindsight prune safe.
+//
+//   sess-<namespace>-<project>-<session-tail>
+//   sess-<project_bank_id>-<session-tail>      (explicit root)
+//
+// The final segment is the random tail of the session UUID, never its prefix:
+// UUIDv7 prefixes encode a millisecond timestamp, so two sessions started in the
+// same ~65s window agree on their first 8 hex characters.
+const MAX_BANK_SEGMENT = 32;
+export function sanitizeBankSegment(value) {
+    const cleaned = value
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-+|-+$/g, "");
+    return cleaned.slice(0, MAX_BANK_SEGMENT).replace(/-+$/g, "") || "unknown";
+}
+export function getBankNamespace(config) {
+    const configured = config?.bank_namespace;
+    if (configured !== undefined) {
+        return configured.trim() === "" ? "" : sanitizeBankSegment(configured);
+    }
+    return sanitizeBankSegment(hostname());
+}
+export function getProjectSlug(cwd = sessionCwd) {
+    if (cwd === homedir())
+        return "home";
+    return sanitizeBankSegment(basename(cwd) || "/");
+}
+export function getSessionSuffix(sessionId) {
+    const raw = (sessionId || "").trim();
+    if (!raw)
+        return "unknown";
+    const tail = raw.split("-").pop() || raw;
+    const cleaned = tail.replace(/[^a-zA-Z0-9]/g, "");
+    return (cleaned || sanitizeBankSegment(raw)).slice(-12);
+}
+function getBankRoot(config, cwd = sessionCwd) {
+    if (config.project_bank_id)
+        return sanitizeBankSegment(config.project_bank_id);
+    const ns = getBankNamespace(config);
+    const slug = getProjectSlug(cwd);
+    return ns ? `${ns}-${slug}` : slug;
+}
+export function getBankScope(config) {
+    return config.bank_scope === "session" ? "session" : "project";
+}
+export function getProjectBank(config, cwd = sessionCwd) {
     if (config?.project_bank_id)
         return config.project_bank_id;
-    return `project-${basename(sessionCwd)}`;
+    const slug = getProjectSlug(cwd);
+    // Project-scope naming stays byte-identical to older releases unless a
+    // namespace was configured explicitly. Session banks are always namespaced.
+    if (!config || config.bank_namespace === undefined)
+        return `project-${slug}`;
+    const ns = getBankNamespace(config);
+    return ns ? `project-${ns}-${slug}` : `project-${slug}`;
+}
+export function getSessionBank(config, sessionId = currentSessionId, cwd = sessionCwd) {
+    return `sess-${getBankRoot(config, cwd)}-${getSessionSuffix(sessionId)}`;
+}
+/** Prefix shared by every session bank this config owns, across projects. */
+export function getSessionBankPrefix(config) {
+    if (config.project_bank_id)
+        return `sess-${sanitizeBankSegment(config.project_bank_id)}-`;
+    const ns = getBankNamespace(config);
+    return ns ? `sess-${ns}-` : null;
 }
 function isHomeDirSession() {
     return sessionCwd === homedir();
 }
-function getRecallBanks(config) {
+export function getRecallBanks(config, sessionId = currentSessionId) {
+    if (getBankScope(config) === "session") {
+        const banks = [getSessionBank(config, sessionId)];
+        // A configured global bank is shared on purpose (cross-project learnings),
+        // so it stays in the mix. Leaving it unset is the true-isolation default.
+        if (config.global_bank)
+            banks.push(config.global_bank);
+        return banks;
+    }
     const banks = new Set();
     if (config.global_bank)
         banks.add(config.global_bank);
@@ -218,7 +321,14 @@ function getRecallBanks(config) {
     }
     return Array.from(banks);
 }
-function getRetainBanks(config, prompt) {
+export function getRetainBanks(config, prompt, sessionId = currentSessionId) {
+    const optInGlobal = !!config.global_bank && (prompt.includes("#global") || prompt.includes("#me"));
+    if (getBankScope(config) === "session") {
+        const banks = [getSessionBank(config, sessionId)];
+        if (optInGlobal)
+            banks.push(config.global_bank);
+        return banks;
+    }
     const banks = new Set();
     const skipProject = isHomeDirSession() && config.homedir_project === false;
     if (!skipProject) {
@@ -226,7 +336,7 @@ function getRetainBanks(config, prompt) {
     }
     // When homedir_project=false, skip auto-retain entirely — explicit hindsight_retain still works
     // Opt-in for global bank retention
-    if (config.global_bank && (prompt.includes("#global") || prompt.includes("#me"))) {
+    if (optInGlobal) {
         banks.add(config.global_bank);
     }
     return Array.from(banks);
@@ -299,6 +409,42 @@ async function getBankStats(config, bank) {
     catch (_) {
         return null;
     }
+}
+async function listBanks(config) {
+    try {
+        const res = await fetch(`${config.api_url}/v1/default/banks`, {
+            headers: { "Authorization": `Bearer ${config.api_key || ""}` }
+        });
+        if (!res.ok)
+            return null;
+        const data = await res.json();
+        return Array.isArray(data) ? data : (data.banks || []);
+    }
+    catch (_) {
+        return null;
+    }
+}
+async function deleteBank(config, bank) {
+    try {
+        const res = await fetch(`${config.api_url}/v1/default/banks/${bank}`, {
+            method: "DELETE",
+            headers: { "Authorization": `Bearer ${config.api_key || ""}` }
+        });
+        return res.ok;
+    }
+    catch (_) {
+        return false;
+    }
+}
+function lastBankActivity(bank) {
+    for (const value of [bank.last_write_at, bank.last_document_at, bank.created_at]) {
+        if (!value)
+            continue;
+        const parsed = Date.parse(value);
+        if (Number.isFinite(parsed))
+            return parsed;
+    }
+    return 0;
 }
 const hookStats = {
     sessionStart: {},
@@ -408,6 +554,12 @@ export async function setupBankMission(config, bank, isGlobal) {
     catch (_) { }
 }
 export async function runMissionAutoSetup(config) {
+    if (getBankScope(config) === "session") {
+        // Session banks are ephemeral: provisioning missions for each one is a
+        // wasted round trip and would create empty banks at session start.
+        log("runMissionAutoSetup: skipped (bank_scope=session)");
+        return;
+    }
     const cache = loadMissionCache();
     const banksToCheck = [];
     if (config.global_bank) {
@@ -473,6 +625,7 @@ export default function hindsightExtension(pi) {
     });
     pi.on("session_start", async (_event, ctx) => {
         sessionCwd = ctx.cwd || process.cwd();
+        currentSessionId = ctx.sessionManager?.getSessionId?.() ?? null;
         recallDone = false;
         recallAttempts = 0;
         hookStats.sessionStart = { firedAt: new Date().toISOString(), result: "ok" };
@@ -484,6 +637,7 @@ export default function hindsightExtension(pi) {
         log("session_start: state reset");
         const config = getConfig();
         if (config) {
+            log(`session_start: scope=${getBankScope(config)} session=${currentSessionId ?? "unknown"} banks=${getRecallBanks(config).join(",")}`);
             const banks = getRecallBanks(config);
             if (banks.length === 0) {
                 ctx.ui.setStatus("hindsight", "⚠ no banks — /hindsight settings to configure");
@@ -513,6 +667,7 @@ export default function hindsightExtension(pi) {
     });
     pi.on("session_compact", async (_event, ctx) => {
         sessionCwd = ctx.cwd || process.cwd();
+        currentSessionId = ctx.sessionManager?.getSessionId?.() ?? currentSessionId;
         recallDone = false;
         recallAttempts = 0;
         retainSuccessCount = 0;
@@ -554,14 +709,16 @@ export default function hindsightExtension(pi) {
         label: "Hindsight Recall",
         description: "Recall relevant context, conventions, or past solutions from the team memory. Use this when the user explicitly asks you to search memory.",
         parameters: Type.Object({
-            query: Type.String()
+            query: Type.String(),
+            bank: Type.Optional(Type.String({ description: "Search this exact bank instead of the current session bank (e.g. a project or global bank)" }))
         }),
-        async execute(_id, params) {
-            const { query } = params;
+        async execute(_id, params, _signal, _onUpdate, ctx) {
+            const { query, bank: explicitBank } = params;
             const config = getConfig();
             if (!config || !config.api_url)
                 return { content: [{ type: "text", text: "Hindsight not configured." }], details: {}, isError: true };
-            const banks = getRecallBanks(config);
+            const sessionId = ctx?.sessionManager?.getSessionId?.() ?? currentSessionId;
+            const banks = explicitBank ? [explicitBank] : getRecallBanks(config, sessionId);
             try {
                 const recallPromises = banks.map(async (bank) => {
                     const reqBody = { query, budget: config.recall_budget, query_timestamp: new Date().toISOString(), types: config.recall_types };
@@ -616,15 +773,18 @@ export default function hindsightExtension(pi) {
         parameters: Type.Object({
             content: Type.String({ description: "The rich context to save" })
         }),
-        async execute(_id, params) {
+        async execute(_id, params, _signal, _onUpdate, ctx) {
             const { content } = params;
             const config = getConfig();
             if (!config || !config.api_url)
                 return { content: [{ type: "text", text: "Hindsight not configured." }], details: {}, isError: true };
+            const sessionId = ctx?.sessionManager?.getSessionId?.() ?? currentSessionId;
             const isHomeDirNoProject = isHomeDirSession() && config.homedir_project === false;
-            const bank = isHomeDirNoProject
-                ? (config.global_bank ?? null)
-                : getProjectBank(config);
+            const bank = getBankScope(config) === "session"
+                ? getSessionBank(config, sessionId)
+                : isHomeDirNoProject
+                    ? (config.global_bank ?? null)
+                    : getProjectBank(config);
             if (!bank)
                 return { content: [{ type: "text", text: "Hindsight: no bank available. Set global_bank in ~/.hindsight/config." }], details: {}, isError: true };
             try {
@@ -652,12 +812,15 @@ export default function hindsightExtension(pi) {
         parameters: Type.Object({
             query: Type.String()
         }),
-        async execute(_id, params) {
+        async execute(_id, params, _signal, _onUpdate, ctx) {
             const { query } = params;
             const config = getConfig();
             if (!config || !config.api_url)
                 return { content: [{ type: "text", text: "Hindsight not configured." }], details: {}, isError: true };
-            const bank = getProjectBank(config);
+            const sessionId = ctx?.sessionManager?.getSessionId?.() ?? currentSessionId;
+            const bank = getBankScope(config) === "session"
+                ? getSessionBank(config, sessionId)
+                : getProjectBank(config);
             try {
                 const controller = new AbortController();
                 const timeout = setTimeout(() => controller.abort(), config.recall_timeout ?? 10000);
@@ -707,7 +870,7 @@ export default function hindsightExtension(pi) {
             return;
         }
         const lastUserPrompt = getLastUserMessage(ctx, currentPrompt) || "Provide context for current project";
-        const banks = getRecallBanks(config);
+        const banks = getRecallBanks(config, ctx.sessionManager?.getSessionId?.() ?? currentSessionId);
         log(`before_agent_start: querying banks=${banks.join(",")} prompt="${lastUserPrompt.slice(0, 80)}"`);
         try {
             let anyBankSucceeded = false;
@@ -827,7 +990,7 @@ export default function hindsightExtension(pi) {
             return;
         }
         const lastUserPrompt = getLastUserMessage(ctx, currentPrompt);
-        const sessionId = ctx.sessionManager?.getSessionId?.() || `unknown-${Date.now()}`;
+        const sessionId = ctx.sessionManager?.getSessionId?.() || currentSessionId;
         if (!lastUserPrompt) {
             log("agent_end: no user prompt found, skipping");
             return;
@@ -882,7 +1045,7 @@ export default function hindsightExtension(pi) {
         if (transcript.length > 50000) {
             transcript = transcript.slice(0, 50000) + "\n...[TRUNCATED]";
         }
-        const banks = getRetainBanks(config, lastUserPrompt);
+        const banks = getRetainBanks(config, lastUserPrompt, sessionId);
         // Count this attempt (before the retain APIs)
         retainEligibleCount++;
         // Async retain: fire and forget, don't block
@@ -898,7 +1061,7 @@ export default function hindsightExtension(pi) {
                     body: JSON.stringify({
                         items: [{
                                 content: transcript,
-                                document_id: `session-${sessionId}`,
+                                document_id: `session-${sessionId ?? "unknown"}`,
                                 update_mode: "append",
                                 context: `pi coding session: ${lastUserPrompt.slice(0, 100)}`,
                                 timestamp: new Date().toISOString(),
@@ -913,34 +1076,42 @@ export default function hindsightExtension(pi) {
                 return bank;
             }));
             retainPromise.then((results) => {
-                const succeededBanks = results
-                    .filter(r => r.status === "fulfilled")
-                    .map(r => r.value);
-                const allFailed = succeededBanks.length === 0;
-                hookStats.retain = {
-                    firedAt: new Date().toISOString(),
-                    result: allFailed ? "failed" : "ok",
-                    detail: allFailed ? "all banks unreachable" : succeededBanks.join(", "),
-                };
-                if (!allFailed)
-                    retainSuccessCount++;
-                const showMessage = config.retain_feedback === "message" || config.retain_feedback === "both";
-                const showStatus = config.retain_feedback === "status" || config.retain_feedback === "both" || !config.retain_feedback;
-                if (allFailed) {
-                    log("agent_end: async retain - all banks failed");
-                    pi.sendMessage({ customType: "hindsight-retain-failed", content: "", display: true }, { deliverAs: "nextTurn" });
-                    if (showStatus) {
-                        ctx.ui.setStatus("hindsight", `Memorized: ${retainSuccessCount}/${retainEligibleCount}`);
+                try {
+                    const succeededBanks = results
+                        .filter(r => r.status === "fulfilled")
+                        .map(r => r.value);
+                    const allFailed = succeededBanks.length === 0;
+                    hookStats.retain = {
+                        firedAt: new Date().toISOString(),
+                        result: allFailed ? "failed" : "ok",
+                        detail: allFailed ? "all banks unreachable" : succeededBanks.join(", "),
+                    };
+                    if (!allFailed)
+                        retainSuccessCount++;
+                    const showMessage = config.retain_feedback === "message" || config.retain_feedback === "both";
+                    const showStatus = config.retain_feedback === "status" || config.retain_feedback === "both" || !config.retain_feedback;
+                    if (allFailed) {
+                        log("agent_end: async retain - all banks failed");
+                        pi.sendMessage({ customType: "hindsight-retain-failed", content: "", display: true }, { deliverAs: "nextTurn" });
+                        if (showStatus) {
+                            ctx.ui.setStatus("hindsight", `Memorized: ${retainSuccessCount}/${retainEligibleCount}`);
+                        }
+                    }
+                    else {
+                        log(`agent_end: async retain - succeeded banks=${succeededBanks.join(",")}`);
+                        if (showStatus) {
+                            ctx.ui.setStatus("hindsight", `Memorized: ${retainSuccessCount}/${retainEligibleCount}`);
+                        }
+                        if (showMessage) {
+                            pi.sendMessage({ customType: "hindsight-retain", content: "", display: true, details: { banks: succeededBanks } }, { deliverAs: "nextTurn" });
+                        }
                     }
                 }
-                else {
-                    log(`agent_end: async retain - succeeded banks=${succeededBanks.join(",")}`);
-                    if (showStatus) {
-                        ctx.ui.setStatus("hindsight", `Memorized: ${retainSuccessCount}/${retainEligibleCount}`);
-                    }
-                    if (showMessage) {
-                        pi.sendMessage({ customType: "hindsight-retain", content: "", display: true, details: { banks: succeededBanks } }, { deliverAs: "nextTurn" });
-                    }
+                catch (e) {
+                    // The turn's ctx is torn down before this callback runs (session
+                    // replacement/reload/compaction), so post-retain UI updates can throw.
+                    // The retain itself already succeeded; never let the report kill the run.
+                    log(`agent_end: post-retain update skipped (ctx stale): ${e}`);
                 }
             });
             return;
@@ -958,7 +1129,7 @@ export default function hindsightExtension(pi) {
                     body: JSON.stringify({
                         items: [{
                                 content: transcript,
-                                document_id: `session-${sessionId}`,
+                                document_id: `session-${sessionId ?? "unknown"}`,
                                 update_mode: "append",
                                 context: `pi coding session: ${lastUserPrompt.slice(0, 100)}`,
                                 timestamp: new Date().toISOString(),
@@ -1021,7 +1192,7 @@ export default function hindsightExtension(pi) {
     // Commands
     // -----------------------------------------------------------------------
     pi.registerCommand("hindsight", {
-        description: "Hindsight memory. Usage: /hindsight [status | stats | settings | doctor]",
+        description: "Hindsight memory. Usage: /hindsight [status | stats | settings | doctor | prune]",
         handler: async (args, ctx) => {
             const config = getConfig();
             if (!config) {
@@ -1046,8 +1217,11 @@ export default function hindsightExtension(pi) {
                 lines.push(`Server: ${health.ok ? "✓ online" : `✗ unreachable${health.status ? ` (HTTP ${health.status})` : ""}`}`);
                 if (!health.ok)
                     hasError = true;
-                // Project bank: auth + mission
-                const bank = getProjectBank(config);
+                // Bank: auth + mission
+                const scope = getBankScope(config);
+                const sessionId = ctx.sessionManager?.getSessionId?.() ?? currentSessionId;
+                const bank = scope === "session" ? getSessionBank(config, sessionId) : getProjectBank(config);
+                lines.push(`Scope:  ${scope}${scope === "session" ? ` (session ${sessionId ?? "unknown"})` : ""}`);
                 lines.push(`Bank:   ${bank}`);
                 const bankCheck = await checkBankConfig(config, bank);
                 if (!bankCheck.ok) {
@@ -1059,6 +1233,9 @@ export default function hindsightExtension(pi) {
                 }
                 if (config.global_bank)
                     lines.push(`Global: ${config.global_bank}`);
+                if (scope === "session") {
+                    lines.push(`Project: ${getProjectBank(config)} (used only with bank_scope=project)`);
+                }
                 // Hook state
                 lines.push("");
                 lines.push("Hooks this session:");
@@ -1081,7 +1258,7 @@ export default function hindsightExtension(pi) {
                 return;
             }
             if (argsStr === "stats") {
-                const banks = getRecallBanks(config);
+                const banks = getRecallBanks(config, ctx.sessionManager?.getSessionId?.() ?? currentSessionId);
                 const allStats = await Promise.all(banks.map(async (bank) => {
                     const stats = await getBankStats(config, bank);
                     return { bank, stats };
@@ -1106,6 +1283,9 @@ export default function hindsightExtension(pi) {
                     { key: "api_url", label: "API URL", isBool: false, default: "(required)" },
                     { key: "api_key", label: "API Key", isBool: false, default: "(required)" },
                     { key: "global_bank", label: "Global Bank", isBool: false, default: "(not set)" },
+                    { key: "bank_scope", label: "Bank Scope (project|session)", isBool: false, default: "project" },
+                    { key: "bank_namespace", label: "Bank Namespace", isBool: false, default: "(hostname)" },
+                    { key: "session_bank_ttl_days", label: "Session Bank TTL (days)", isBool: false, default: "30" },
                     { key: "project_bank_id", label: "Project Bank Override", isBool: false, default: "(auto)" },
                     { key: "recall_enabled", label: "Auto-Recall", isBool: true, default: "true" },
                     { key: "retain_enabled", label: "Auto-Retain", isBool: true, default: "true" },
@@ -1209,12 +1389,58 @@ export default function hindsightExtension(pi) {
                 }
                 return;
             }
+            if (argsStr === "prune" || argsStr.startsWith("prune ")) {
+                const parts = argsStr.split(/\s+/).slice(1);
+                const daysArg = parts.find(p => /^\d+$/.test(p));
+                const days = daysArg ? parseInt(daysArg, 10) : (config.session_bank_ttl_days ?? 30);
+                const confirmed = parts.includes("--yes");
+                const prefix = getSessionBankPrefix(config);
+                if (!prefix) {
+                    ctx.ui.notify("Refusing to prune: session banks cannot be identified safely without bank_namespace or project_bank_id.", "error");
+                    return;
+                }
+                const all = await listBanks(config);
+                if (!all) {
+                    ctx.ui.notify("Could not list banks from the server.", "error");
+                    return;
+                }
+                const protectedBanks = new Set([
+                    config.global_bank,
+                    getProjectBank(config),
+                    getSessionBank(config, ctx.sessionManager?.getSessionId?.() ?? currentSessionId),
+                ].filter(Boolean));
+                const cutoff = Date.now() - days * 86400000;
+                const candidates = all.filter((b) => b.bank_id.startsWith(prefix) &&
+                    !protectedBanks.has(b.bank_id) &&
+                    lastBankActivity(b) > 0 &&
+                    lastBankActivity(b) < cutoff);
+                if (candidates.length === 0) {
+                    ctx.ui.notify(`No session banks idle for more than ${days} day(s).`, "info");
+                    return;
+                }
+                const listing = candidates
+                    .map(b => `  ${b.bank_id} (${b.fact_count ?? "?"} facts, last write ${b.last_write_at?.slice(0, 10) ?? "unknown"})`)
+                    .join("\n");
+                if (!confirmed) {
+                    ctx.ui.notify(`${candidates.length} session bank(s) idle for ${days}+ day(s):\n${listing}\n\nNothing deleted. Re-run with --yes to delete.`, "warning");
+                    return;
+                }
+                let deleted = 0;
+                for (const b of candidates) {
+                    if (await deleteBank(config, b.bank_id))
+                        deleted++;
+                }
+                ctx.ui.notify(`Deleted ${deleted}/${candidates.length} session bank(s):\n${listing}`, deleted === candidates.length ? "info" : "warning");
+                return;
+            }
             const status = [
                 `URL: ${config.api_url || "Not set"}`,
                 `Global Bank: ${config.global_bank || "Not set"}`,
-                `Project Bank (Recall & Default Retain): ${getProjectBank(config)}`,
-                `Active Recall Banks: ${getRecallBanks(config).join(", ")}`,
-                `Commands: /hindsight status | stats | settings | doctor`,
+                `Bank Scope: ${getBankScope(config)}`,
+                `Active Bank: ${getBankScope(config) === "session" ? getSessionBank(config, ctx.sessionManager?.getSessionId?.() ?? currentSessionId) : getProjectBank(config)}`,
+                `Project Bank: ${getProjectBank(config)}`,
+                `Active Recall Banks: ${getRecallBanks(config, ctx.sessionManager?.getSessionId?.() ?? currentSessionId).join(", ")}`,
+                `Commands: /hindsight status | stats | settings | doctor | prune`,
             ].join("\n");
             ctx.ui.notify(status, "info");
         },

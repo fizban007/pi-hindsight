@@ -78,6 +78,25 @@ Or use the interactive `/hindsight settings` command.
 
 Manual tools (`hindsight_recall`, `hindsight_retain`, `hindsight_reflect`) remain available regardless.
 
+### Session isolation (`bank_scope = session`)
+
+By default (`bank_scope = project`) every session in a directory shares one bank, so concurrent sessions read each other's turns. Set `bank_scope = session` for true isolation: each Pi session gets its own bank, and recall can only ever see that session's own memory.
+
+```toml
+bank_scope = "session"
+```
+
+Session banks are named `sess-<namespace>-<project>-<session-tail>`, for example `sess-alexchenhplaptop-pi-de30d68730cd`. The namespace is your hostname unless you set `bank_namespace`, which is what keeps two machines that share one Hindsight server from deriving the same bank id for the same session. Resuming a session keeps its id, so its bank and memory survive restarts; forking gets a new id and a new bank.
+
+With session scope:
+
+- Retain writes only to the session bank. `#global`/`#me` still publishes to the global bank.
+- Recall reads the session bank, plus `global_bank` if you configured one — that bank is shared on purpose. Leave `global_bank` unset for complete isolation.
+- `homedir_project` no longer applies: home is just another project slug.
+- Session banks are ephemeral. `/hindsight prune` deletes ones that have been idle for a while.
+
+Use `hindsight_recall` with its `bank` argument to read another bank deliberately (a project bank, a sibling session, the global bank).
+
 ### Home directory handling
 
 When Pi runs from your home directory, the global config (`~/.hindsight/config`) and local config (`.hindsight/config` in CWD) are the same file. This means a `project-<username>` bank is created alongside your global bank, causing duplicate recall and retain.
@@ -100,7 +119,7 @@ With this set, sessions started from the home directory use only the global bank
 
 ### Manual tools
 
-- `hindsight_recall`: Pull additional context from memory on demand.
+- `hindsight_recall`: Pull additional context from memory on demand. Pass `bank` to search a specific bank instead of the current session bank.
 - `hindsight_retain`: Force-save a specific insight.
 - `hindsight_reflect`: Ask Hindsight to synthesize an answer from your memories (server-side reasoning).
 
@@ -138,7 +157,10 @@ recall_max_tokens = 512
 | `async_retain` | `true` | Non-blocking retain. Set `false` for sync retain with failure notifications. |
 | `recall_enabled` | `true` | Enable automatic recall before agent turns. Set `false` to disable auto-recall for this project. Manual `hindsight_recall` tool still works. |
 | `retain_enabled` | `true` | Enable automatic retain after agent turns. Set `false` to disable auto-retain for this project. Manual `hindsight_retain` tool still works. |
-| `homedir_project` | `true` | Treat home directory as a project. Set `false` to prevent creating a `project-<username>` bank when running Pi from your home directory. Recall and retain use only `global_bank` instead. |
+| `homedir_project` | `true` | Treat home directory as a project. Set `false` to prevent creating a `project-<username>` bank when running Pi from your home directory. Recall and retain use only `global_bank` instead. Ignored when `bank_scope = session`. |
+| `bank_scope` | `project` | `project` shares one bank per directory. `session` gives every Pi session its own bank, so concurrent sessions never read each other's memory. |
+| `bank_namespace` | hostname | Machine identity embedded in session bank ids. Set this when your hostname is unstable or shared across machines. Set it to an empty string to omit the namespace (only safe if one machine uses the server). |
+| `session_bank_ttl_days` | `30` | Default age for `/hindsight prune` when no day count is given. |
 | `global_bank` | _(none)_ | Bank ID for cross-project memory. When set, this bank is queried alongside the project bank on every recall. Turns tagged `#global` or `#me` are also retained here. Leave unset if you only want per-project memory. |
 
 ### Environment variable overrides
@@ -147,12 +169,14 @@ Banks can also be steered from the environment, using the same variables omp rea
 
 | Variable | Effect |
 |----------|--------|
-| `HINDSIGHT_BANK_ID` | Replaces the project bank — the primary bank for both recall and retain. Also overrides any `project_bank_id` config key. |
-| `HINDSIGHT_SCOPING=global` | Additionally replaces `global_bank` with `HINDSIGHT_BANK_ID`, collapsing recall + retain into one flat bank per agent (same semantics as omp's `global` scoping). |
-| `HINDSIGHT_SCOPING=per-project` / `per-project-tagged` | Overrides the project bank only; the configured `global_bank` stays in the recall mix. pi-hindsight has no tag-scoped scoping, so omp's per-project-tagged behavior (same bank with project tags) is approximated, not replicated. |
+| `HINDSIGHT_BANK_ID` | Replaces the bank root. With `bank_scope = session` it is the root that session banks are derived from (`sess-<root>-<tail>`); with `bank_scope = project` it is the exact bank. Also overrides any `project_bank_id` config key. |
+| `HINDSIGHT_BANK_SCOPE` | `session` or `project` — overrides `bank_scope`. |
+| `HINDSIGHT_BANK_NAMESPACE` | Overrides `bank_namespace`. |
+| `HINDSIGHT_SCOPING=global` | Additionally replaces `global_bank` with `HINDSIGHT_BANK_ID`, collapsing recall + retain into one flat bank per agent (same semantics as omp's `global` scoping). Also pins the exact bank, disabling session scope. |
+| `HINDSIGHT_SCOPING=per-project` / `per-project-tagged` | Pins project scoping; the configured `global_bank` stays in the recall mix. pi-hindsight has no tag-scoped scoping, so omp's per-project-tagged behavior (same bank with project tags) is approximated, not replicated. |
 | `HINDSIGHT_RETAIN_EVERY_N_TURNS` | Ignored — omp-only. Retention runs at `agent_end` on every turn. |
 
-Precedence: environment > project config > global config > `project-<dirname>` default. Without `HINDSIGHT_BANK_ID` the environment has no effect. `HINDSIGHT_DEBUG=1` turns on debug logging (see below).
+Precedence: environment > project config > global config > `project-<dirname>` default. Without `HINDSIGHT_BANK_ID` the environment still applies `HINDSIGHT_BANK_SCOPE` / `HINDSIGHT_BANK_NAMESPACE`; other config-driven setups are unaffected. `HINDSIGHT_DEBUG=1` turns on debug logging (see below).
 
 An explicit `HINDSIGHT_BANK_ID` is also active in the home directory, even when `homedir_project` is `false`.
 
@@ -164,20 +188,24 @@ Full health check: server reachability, auth, bank access, hook state, debug log
 ```
 URL:    http://localhost:8888
 Server: ✓ online
-Bank:   project-myapp
+Scope:  session (session 01a18aa6-cf2c-71a6-8b67-de30d68730cd)
+Bank:   sess-alexchenhplaptop-pi-de30d68730cd
   ✓ auth ok
 Global: global-bank
 
 Hooks this session:
   session_start:      ✓ ok
   recall:             ✓ ok (3 memories)
-  retain:             ✓ ok (project-myapp)
+  retain:             ✓ ok (sess-alexchenhplaptop-pi-de30d68730cd)
 
 Debug log: disabled (set HINDSIGHT_DEBUG=1 to enable)
 ```
 
 ### `/hindsight stats`
 Memory, entity, and document counts for all active banks.
+
+### `/hindsight prune [days] [--yes]`
+Lists session banks (matching this config's namespace) that have been idle for more than `days` (default `session_bank_ttl_days`, 30), and deletes them only with `--yes`. It never touches the global bank, the project bank, or the current session's bank, and it refuses to run when session banks cannot be identified safely.
 
 ### `/hindsight settings`
 Interactive settings menu. View all current settings with their source (global, project, or default), toggle boolean settings, edit text values, and choose where to save (project or global config). When running from the home directory, saves go to global config only.
@@ -200,6 +228,12 @@ Or to disable home directory as a project:
 ### Project bank
 
 Named `project-<dirname>` based on your current working directory, created automatically on first use. No setup required. All turns are retained here by default, so each project builds its own isolated memory over time.
+
+When `bank_namespace` is set explicitly, the name becomes `project-<namespace>-<dirname>` so machines sharing a server do not collide. With `bank_scope = session`, the project bank is not written to; it is only readable via `hindsight_recall`'s `bank` argument.
+
+### Session bank
+
+With `bank_scope = session`, each session owns `sess-<namespace>-<project>-<session-tail>`. Nothing else writes there, and recall never leaves it (except for a configured `global_bank`). The bank is created on the first retained turn. Use `/hindsight prune` to clean up old ones — a long-lived setup accumulates one bank per session.
 
 ### Global bank
 

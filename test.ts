@@ -32,6 +32,7 @@ function makePiMock() {
     registerCommand(name: string, spec: any) {
       commands[name] = spec;
     },
+    registerMessageRenderer(_type: string, _renderer: any) {},
     // Test helpers
     async emit(event: HookName, eventData: any = {}, ctx: any = {}) {
       const list = handlers[event] || [];
@@ -897,8 +898,8 @@ describe("Retain async_retain config", () => {
 
 // ─── inferProjectMission tests ────────────────────────────────────────────────
 
-import { mkdtempSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { tmpdir, homedir } from "node:os";
 import { join as pathJoin, basename as pathBasename } from "node:path";
 
 describe("inferProjectMission", () => {
@@ -1426,10 +1427,17 @@ describe("applyEnvOverrides", { skip: !extensionDepsInstalled && "extension deps
   beforeEach(() => {
     delete process.env.HINDSIGHT_BANK_ID;
     delete process.env.HINDSIGHT_SCOPING;
+    delete process.env.HINDSIGHT_BANK_SCOPE;
+    delete process.env.HINDSIGHT_BANK_NAMESPACE;
   });
 
   after(() => {
-    process.env = originalEnv;
+    // Never assign to process.env wholesale: that resets every variable
+    // (including HOME) and races with other suites' before hooks.
+    for (const key of ["HINDSIGHT_BANK_ID", "HINDSIGHT_SCOPING", "HINDSIGHT_BANK_SCOPE", "HINDSIGHT_BANK_NAMESPACE"] as const) {
+      if (originalEnv[key] === undefined) delete process.env[key];
+      else process.env[key] = originalEnv[key];
+    }
   });
 
   function env(bank?: string, scoping?: string): Record<string, string> {
@@ -1486,5 +1494,256 @@ describe("applyEnvOverrides", { skip: !extensionDepsInstalled && "extension deps
     const merged = env("  agent-bank  ", "global");
     assert.equal(merged.project_bank_id, "agent-bank");
     assert.equal(merged.global_bank, "");
+  });
+});
+
+// ─── session-scoped banks ────────────────────────────────────────────────────
+
+describe("session bank resolution", { skip: !extensionDepsInstalled && "extension deps not installed (run npm ci)" }, () => {
+  let mod: any;
+
+  before(async () => {
+    mod = await import("./index.ts");
+  });
+
+  // A UUIDv7 pair started in the same ~65s window: identical 8-char prefix.
+  const SID_A = "01a18aa6-cf2c-71a6-8b67-de30d68730cd";
+  const SID_B = "01a18aa6-cf2c-71a6-8b67-aaaa11112222";
+
+  after(() => {
+    for (const key of ["HINDSIGHT_BANK_ID", "HINDSIGHT_SCOPING", "HINDSIGHT_BANK_SCOPE", "HINDSIGHT_BANK_NAMESPACE"] as const) {
+      delete process.env[key];
+    }
+  });
+
+  function cfg(over: Record<string, unknown> = {}) {
+    return {
+      api_url: "http://x",
+      bank_scope: "session",
+      bank_namespace: "machine-a",
+      ...over,
+    } as any;
+  }
+
+  test("derives sess-<namespace>-<project>-<tail>", () => {
+    assert.equal(mod.getSessionBank(cfg(), SID_A, "/home/alex/proj"), "sess-machine-a-proj-de30d68730cd");
+  });
+
+  test("two sessions started in the same window get different banks", () => {
+    assert.equal(SID_A.slice(0, 8), SID_B.slice(0, 8), "test precondition: prefixes collide");
+    assert.notEqual(
+      mod.getSessionBank(cfg(), SID_A, "/home/alex/proj"),
+      mod.getSessionBank(cfg(), SID_B, "/home/alex/proj")
+    );
+  });
+
+  test("same session id resolves to the same bank (resume keeps memory)", () => {
+    assert.equal(
+      mod.getSessionBank(cfg(), SID_A, "/home/alex/proj"),
+      mod.getSessionBank(cfg(), SID_A, "/home/alex/proj")
+    );
+  });
+
+  test("namespace separates machines sharing one server", () => {
+    const a = mod.getSessionBank(cfg({ bank_namespace: "machine-a" }), SID_A, "/home/alex/proj");
+    const b = mod.getSessionBank(cfg({ bank_namespace: "machine-b" }), SID_A, "/home/alex/proj");
+    assert.notEqual(a, b);
+  });
+
+  test("empty namespace is honored", () => {
+    assert.equal(mod.getSessionBank(cfg({ bank_namespace: "" }), SID_A, "/home/alex/proj"), "sess-proj-de30d68730cd");
+  });
+
+  test("explicit project_bank_id becomes the root", () => {
+    assert.equal(
+      mod.getSessionBank(cfg({ project_bank_id: "pi-config-box" }), SID_A, "/home/alex/proj"),
+      "sess-pi-config-box-de30d68730cd"
+    );
+  });
+
+  test("home directory uses a stable slug", () => {
+    assert.equal(mod.getSessionBank(cfg(), SID_A, homedir()), "sess-machine-a-home-de30d68730cd");
+  });
+
+  test("sanitizes hostile namespace and project names", () => {
+    assert.equal(
+      mod.getSessionBank(cfg({ bank_namespace: "Alex Chen HP.laptop" }), SID_A, "/x/My Project!"),
+      "sess-alex-chen-hp-laptop-my-project-de30d68730cd"
+    );
+  });
+
+  test("missing session id degrades to unknown", () => {
+    assert.equal(mod.getSessionBank(cfg(), null, "/home/alex/proj"), "sess-machine-a-proj-unknown");
+  });
+
+  test("recall in session scope touches only this session's bank", () => {
+    const bankA = mod.getSessionBank(cfg(), SID_A);
+    const bankB = mod.getSessionBank(cfg(), SID_B);
+    assert.deepEqual(mod.getRecallBanks(cfg(), SID_A), [bankA]);
+    assert.deepEqual(mod.getRecallBanks(cfg(), SID_B), [bankB]);
+    assert.notEqual(bankA, bankB);
+  });
+
+  test("recall in session scope still includes an explicitly configured global bank", () => {
+    assert.deepEqual(
+      mod.getRecallBanks(cfg({ global_bank: "shared" }), SID_A),
+      [mod.getSessionBank(cfg(), SID_A), "shared"]
+    );
+  });
+
+  test("retain in session scope goes to the session bank only", () => {
+    assert.deepEqual(mod.getRetainBanks(cfg({ global_bank: "shared" }), "plain prompt", SID_A), [
+      mod.getSessionBank(cfg(), SID_A),
+    ]);
+  });
+
+  test("#global still publishes to the global bank", () => {
+    assert.deepEqual(mod.getRetainBanks(cfg({ global_bank: "shared" }), "#global remember this", SID_A), [
+      mod.getSessionBank(cfg(), SID_A),
+      "shared",
+    ]);
+  });
+
+  test("project scope keeps the legacy bank naming", () => {
+    const projectCfg = cfg({ bank_scope: "project", bank_namespace: undefined, project_bank_id: undefined });
+    const projectBank = mod.getProjectBank(projectCfg);
+    assert.match(projectBank, /^project-/);
+    assert.deepEqual(mod.getRecallBanks(projectCfg, SID_A), [projectBank]);
+    assert.deepEqual(mod.getRetainBanks(projectCfg, "prompt", SID_A), [projectBank]);
+  });
+
+  test("project scope with an explicit namespace opts into namespaced banks", () => {
+    const projectCfg = cfg({ bank_scope: "project", bank_namespace: "machine-a" });
+    assert.equal(mod.getProjectBank(projectCfg, "/home/alex/proj"), "project-machine-a-proj");
+  });
+
+  test("session bank prefix scopes pruning to this machine", () => {
+    assert.equal(mod.getSessionBankPrefix(cfg()), "sess-machine-a-");
+    assert.equal(mod.getSessionBankPrefix(cfg({ project_bank_id: "pinned" })), "sess-pinned-");
+    assert.equal(mod.getSessionBankPrefix(cfg({ bank_namespace: "" })), null);
+  });
+
+  test("env HINDSIGHT_BANK_SCOPE/NAMESPACE override config", () => {
+    const merged: Record<string, string> = { bank_scope: "project", bank_namespace: "from-config" };
+    process.env.HINDSIGHT_BANK_SCOPE = "session";
+    process.env.HINDSIGHT_BANK_NAMESPACE = "from-env";
+    mod.applyEnvOverrides(merged);
+    assert.equal(merged.bank_scope, "session");
+    assert.equal(merged.bank_namespace, "from-env");
+  });
+
+  test("HINDSIGHT_SCOPING=global pins the exact bank and disables session scope", () => {
+    const merged: Record<string, string> = { bank_scope: "session" };
+    process.env.HINDSIGHT_BANK_ID = "pinned-bank";
+    process.env.HINDSIGHT_SCOPING = "global";
+    mod.applyEnvOverrides(merged);
+    assert.equal(merged.project_bank_id, "pinned-bank");
+    assert.equal(merged.bank_scope, "project");
+  });
+});
+
+
+// ─── hook-level isolation (real factory, mocked network) ─────────────────────
+
+describe("hook-level session isolation", { skip: !extensionDepsInstalled && "extension deps not installed (run npm ci)" }, () => {
+  const SID_A = "01a18aa6-cf2c-71a6-8b67-de30d68730cd";
+  const SID_B = "01a18aa6-cf2c-71a6-8b67-aaaa11112222";
+  const CWD = "/work/proj";
+
+  let hindsightExtension: any;
+  let fakeHome: string;
+  let originalHome: string | undefined;
+  let recorded: { url: string; method: string; body: any }[];
+
+  function makeSessionCtx(sid: string, prompt: string) {
+    return {
+      cwd: CWD,
+      sessionManager: {
+        getSessionId: () => sid,
+        getEntries: () => (prompt ? [{ type: "message", message: { role: "user", content: prompt } }] : []),
+      },
+      ui: { setStatus() {}, notify() {} },
+    };
+  }
+
+  before(async () => {
+    originalHome = process.env.HOME;
+    fakeHome = mkdtempSync(pathJoin(tmpdir(), "hindsight-session-test-"));
+    mkdirSync(pathJoin(fakeHome, ".hindsight"), { recursive: true });
+    writeFileSync(
+      pathJoin(fakeHome, ".hindsight", "config"),
+      [
+        'api_url = "http://fake-hindsight"',
+        'api_key = "test-key"',
+        'bank_scope = "session"',
+        'bank_namespace = "testbox"',
+        'async_retain = "false"',
+      ].join("\n") + "\n"
+    );
+    process.env.HOME = fakeHome;
+
+    (global as any).fetch = async (url: any, opts: any = {}) => {
+      let parsed: any;
+      try { parsed = opts.body ? JSON.parse(opts.body) : undefined; } catch { parsed = opts.body; }
+      recorded.push({ url: String(url), method: opts.method || "GET", body: parsed });
+      return { ok: true, status: 200, json: async () => ({ results: [] }) };
+    };
+
+    ({ default: hindsightExtension } = await import("./index.ts"));
+  });
+
+  beforeEach(() => {
+    recorded = [];
+  });
+
+  after(() => {
+    process.env.HOME = originalHome;
+    rmSync(fakeHome, { recursive: true, force: true });
+  });
+
+  async function runTurn(sid: string, prompt: string) {
+    const pi = makePiMock();
+    hindsightExtension(pi);
+    const ctx = makeSessionCtx(sid, prompt);
+    await pi.emit("session_start", {}, ctx);
+    const before = recorded.length;
+    await pi.emit("agent_end", { messages: [{ role: "assistant", content: "here is the answer" }] }, ctx);
+    return recorded
+      .slice(before)
+      .filter(r => r.method === "POST" && r.url.includes("/memories"));
+  }
+
+  test("retains to this session's bank, never the shared project bank", async () => {
+    const retains = await runTurn(SID_A, "please refactor the parser");
+    assert.equal(retains.length, 1);
+    assert.ok(
+      retains[0].url.includes("/banks/sess-testbox-proj-de30d68730cd/memories"),
+      `unexpected retain URL: ${retains[0].url}`
+    );
+    assert.ok(!retains[0].url.includes("project-proj"), "must not touch the shared project bank");
+  });
+
+  test("two sessions in the same directory retain into different banks", async () => {
+    const a = await runTurn(SID_A, "session A task");
+    const b = await runTurn(SID_B, "session B task");
+    assert.equal(a.length, 1);
+    assert.equal(b.length, 1);
+    assert.ok(a[0].url.includes("sess-testbox-proj-de30d68730cd"));
+    assert.ok(b[0].url.includes("sess-testbox-proj-aaaa11112222"));
+    assert.notEqual(a[0].url, b[0].url);
+  });
+
+  test("session bank documents stay keyed by the session id", async () => {
+    const retains = await runTurn(SID_A, "a prompt long enough to retain");
+    assert.equal(retains[0].body.items[0].document_id, `session-${SID_A}`);
+  });
+
+  test("session scope skips mission provisioning at session_start", async () => {
+    const pi = makePiMock();
+    hindsightExtension(pi);
+    recorded = [];
+    await pi.emit("session_start", {}, makeSessionCtx(SID_A, ""));
+    const missionCalls = recorded.filter(r => r.url.includes("/profile") || r.url.includes("/config"));
+    assert.equal(missionCalls.length, 0, "should not provision missions for ephemeral session banks");
   });
 });
