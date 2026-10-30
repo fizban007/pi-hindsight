@@ -11,8 +11,7 @@ requests from here.
 ## Replicate on another machine
 
 ```bash
-gh auth login                       # private repo needs auth
-git clone git@github.com:fizban007/pi-hindsight.git ~/Projects/pi-hindsight
+git clone https://github.com/fizban007/pi-hindsight.git ~/Projects/pi-hindsight
 cd ~/Projects/pi-hindsight && npm ci && npm run build
 
 pi remove npm:pi-hindsight          # otherwise two copies load and double-retain
