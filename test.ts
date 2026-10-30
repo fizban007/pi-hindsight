@@ -1655,14 +1655,17 @@ describe("hook-level session isolation", { skip: !extensionDepsInstalled && "ext
   let originalHome: string | undefined;
   let recorded: { url: string; method: string; body: any }[];
 
-  function makeSessionCtx(sid: string, prompt: string) {
+  function makeSessionCtx(sid: string, prompt: string, statuses?: string[]) {
     return {
       cwd: CWD,
       sessionManager: {
         getSessionId: () => sid,
         getEntries: () => (prompt ? [{ type: "message", message: { role: "user", content: prompt } }] : []),
       },
-      ui: { setStatus() {}, notify() {} },
+      ui: {
+        setStatus(_key: string, value?: string) { if (statuses && value) statuses.push(value); },
+        notify() {},
+      },
     };
   }
 
@@ -1736,6 +1739,71 @@ describe("hook-level session isolation", { skip: !extensionDepsInstalled && "ext
   test("session bank documents stay keyed by the session id", async () => {
     const retains = await runTurn(SID_A, "a prompt long enough to retain");
     assert.equal(retains[0].body.items[0].document_id, `session-${SID_A}`);
+  });
+
+  test("a not-yet-created session bank is an empty vault, not a recall failure", async () => {
+    const defaultFetch = (global as any).fetch;
+    const calls: string[] = [];
+    (global as any).fetch = async (url: any, opts: any = {}) => {
+      calls.push(`${opts.method || "GET"} ${String(url)}`);
+      if (String(url).includes("/memories/recall")) {
+        return {
+          ok: false,
+          status: 404,
+          text: async () => '{"detail":"Bank not found"}',
+          json: async () => ({ detail: "Bank not found" }),
+        };
+      }
+      return { ok: true, status: 200, json: async () => ({ results: [] }) };
+    };
+
+    try {
+      const statuses: string[] = [];
+      const pi = makePiMock();
+      hindsightExtension(pi);
+      const ctx = makeSessionCtx(SID_A, "a prompt that needs recall", statuses);
+      await pi.emit("session_start", {}, ctx);
+      await pi.emit("before_agent_start", {}, ctx);
+      await pi.emit("before_agent_start", {}, ctx);
+
+      const recalls = calls.filter(c => c.includes("/memories/recall"));
+      assert.equal(recalls.length, 1, "404 must not trigger the retry path");
+      assert.ok(
+        !statuses.some(s => s.includes("recall failed") || s.includes("recall unavailable")),
+        `unexpected failure status: ${statuses.join(", ")}`
+      );
+    } finally {
+      (global as any).fetch = defaultFetch;
+    }
+  });
+
+  test("recall query uses the prompt text, not the content-block JSON", async () => {
+    const pi = makePiMock();
+    hindsightExtension(pi);
+    const ctx = {
+      ...makeSessionCtx(SID_A, ""),
+      sessionManager: {
+        getSessionId: () => SID_A,
+        getEntries: () => [{
+          type: "message",
+          message: {
+            role: "user",
+            content: [
+              { type: "image", source: { data: "BASE64IMAGE" } },
+              { type: "text", text: "why does the parser drop the trailing newline?" },
+            ],
+          },
+        }],
+      },
+    };
+    recorded = [];
+    await pi.emit("session_start", {}, ctx);
+    await pi.emit("before_agent_start", {}, ctx);
+
+    const recall = recorded.find(r => r.url.includes("/memories/recall"));
+    assert.ok(recall, "recall should have been attempted");
+    assert.equal(recall!.body.query, "why does the parser drop the trailing newline?");
+    assert.ok(!JSON.stringify(recall!.body).includes("BASE64IMAGE"), "image data must not be the query");
   });
 
   test("session scope skips mission provisioning at session_start", async () => {

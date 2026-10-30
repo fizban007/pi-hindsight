@@ -396,9 +396,18 @@ function getLastUserMessage(ctx: any, fallbackPrompt: string): string {
     for (let i = entries.length - 1; i >= 0; i--) {
       const e = entries[i];
       if (e.type === "message" && e.message?.role === "user") {
-        return typeof e.message.content === "string"
-          ? e.message.content
-          : JSON.stringify(e.message.content);
+        const content = e.message.content;
+        if (typeof content === "string") return content;
+        if (Array.isArray(content)) {
+          // Join text blocks only. JSON.stringify would send the wrapper (and
+          // any base64 image payload) to the reranker as the query.
+          const text = content
+            .filter((block: any) => block?.type === "text" && typeof block.text === "string")
+            .map((block: any) => block.text)
+            .join("\n")
+            .trim();
+          if (text) return text;
+        }
       }
     }
   } catch (e) {}
@@ -421,13 +430,18 @@ async function getBankMission(config: HindsightConfig, bank: string): Promise<st
 }
 
 async function checkBankConfig(config: HindsightConfig, bank: string): Promise<
-  | { ok: true; mission: string | null }
+  | { ok: true; mission: string | null; missing?: boolean }
   | { ok: false; authError: boolean }
 > {
   try {
     const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/profile`, {
       headers: { "Authorization": `Bearer ${config.api_key || ""}` }
     });
+    if (res.status === 404) {
+      // Session banks are created on first retain. A 404 means the bank does
+      // not exist yet, not that auth or the server is broken.
+      return { ok: true, mission: null, missing: true };
+    }
     if (res.status === 401 || res.status === 403) return { ok: false, authError: true };
     if (!res.ok) return { ok: false, authError: false };
     const data = await res.json();
@@ -1007,6 +1021,14 @@ export default function hindsightExtension(pi: ExtensionAPI) {
             rateLimitedFailed = true;
             return [];
           }
+          if (res.status === 404) {
+            // A session bank is created by the first retain. Before that, the
+            // bank does not exist — that is an empty vault, not a failure, and
+            // must not trigger the retry/backoff path.
+            anyBankSucceeded = true;
+            log(`before_agent_start: bank=${bank} does not exist yet (empty session bank)`);
+            return [];
+          }
           if (!res.ok) {
             if (res.status === 401 || res.status === 403) authFailed = true;
             return [];
@@ -1355,6 +1377,8 @@ export default function hindsightExtension(pi: ExtensionAPI) {
         if (!bankCheck.ok) {
           lines.push(`  ✗ ${bankCheck.authError ? "auth invalid - check api_key" : "bank unreachable"}`);
           hasError = true;
+        } else if (bankCheck.missing) {
+          lines.push(`  ✓ auth ok (bank created on first retain)`);
         } else {
           lines.push(`  ✓ auth ok`);
         }
