@@ -1,7 +1,7 @@
 # This fork
 
 Public fork of [anh-chu/pi-hindsight](https://github.com/anh-chu/pi-hindsight).
-The fork is based on upstream `1.5.1`; it can track upstream and send pull
+The fork is based on upstream `1.5.2`; it can track upstream and send pull
 requests from here. A fresh clone has only `origin` — add the upstream remote
 when you want to sync:
 
@@ -17,19 +17,19 @@ One memory bank per project **per machine**:
 project-<namespace>-<slug>      e.g.  project-alexchenhplaptop-pi
 ```
 
-The slug is the current directory's basename, lowercased, reduced to
+The slug is the git repository's folder name when the cwd is inside git, so a
+worktree and every subdirectory share the repository's bank. Outside git it is
+the current directory's basename. Either way it is lowercased, reduced to
 `[a-z0-9-]`, and truncated to 32 characters (`/home/alex/.pi` → `pi`,
 `~/Projects/Aperture4` → `aperture4`, the home directory itself → `home`).
 The namespace is `bank_namespace`, sanitized the same way.
 
-Current upstream (1.5.x) names project banks after the git repository folder,
-worktree-aware, and also recalls a legacy `project-<dirname>` bank. At the
-commit this fork is based on, upstream used `project-<dirname>`. Either way,
-the collision this fork cares about is real: several machines share one
-Hindsight server, so `project-pi` on the laptop and `project-pi` on the
-workstation are the *same bank*. Both write into it, neither can tell which
-facts came from where, and memory from one machine's checkout surfaces while
-you work in another's.
+Upstream 1.5.2 introduced the same repository/worktree-aware naming. This fork
+keeps it and adds the namespace, so several machines can share one Hindsight
+server without `project-pi` on the laptop and `project-pi` on the workstation
+being the *same bank*. Without the namespace, both write into one bank, neither
+can tell which facts came from where, and memory from one machine's checkout
+surfaces while you work in another's.
 
 So the requirement this fork exists to satisfy:
 
@@ -43,10 +43,13 @@ every bank on that server. If machines must be truly unable to read each
 other's banks, run separate servers, or use a tenant/auth setup that maps each
 machine to its own isolated tenant. `bank_namespace` alone does not do that.
 
-The mapping is also not one-to-one in every case: two different directories
-with the same basename on one machine share a bank, while a repository's
-worktrees and subdirectories get separate banks. Long names are truncated to
-32 characters, so very long names can also collide.
+The mapping is also not one-to-one in every case: two different non-git
+directories with the same basename on one machine share a bank. Long names are
+truncated to 32 characters, so very long names can also collide. Inside git,
+worktrees and subdirectories of the same repository intentionally share the
+repository's bank; the old folder-name bank for this config
+(`project-<folder>` or `project-<namespace>-<folder>`) is still read for recall
+so old memories remain reachable.
 
 Everything else in this fork is optional; see [the end](#optional-session-scoped-banks).
 
@@ -66,11 +69,10 @@ recall_enabled = true
 your server's address.
 
 `bank_namespace` is the key this fork adds, and setting it is **not** optional:
-`getProjectBank()` keeps the legacy `project-<slug>` name when the key is
-absent, so a missing namespace silently reintroduces the collision. (That
-legacy name was byte-identical to the pre-namespace upstream; current upstream
-uses repository-aware naming instead.) Use a stable machine name, not a DHCP
-hostname. Session banks fall back to the hostname; project banks never do.
+`getProjectBank()` keeps the unnamespaced `project-<slug>` name when the key is
+absent, so a missing namespace silently reintroduces the collision. Use a
+stable machine name, not a DHCP hostname. Session banks fall back to the
+hostname; project banks never do.
 
 The bank id then resolves to `project-<namespace>-<slug>`:
 
@@ -85,12 +87,17 @@ write to.
 
 ### Migrating from upstream
 
-Namespaced banks start empty — an existing `project-<slug>` bank is not renamed
-and is not read. If it holds something worth keeping, read it deliberately with
-`hindsight_recall`'s `bank` argument first, then delete it with the Hindsight
-API (`DELETE /v1/default/banks/<bank_id>`) or another client. This extension
-has no command for deleting project banks; `/hindsight prune` only touches
-`sess-` banks.
+An existing upstream `project-<slug>` bank is not renamed and is not read by a
+namespaced config. If it holds something worth keeping, read it deliberately
+with `hindsight_recall`'s `bank` argument first, then delete it with the
+Hindsight API (`DELETE /v1/default/banks/<bank_id>`) or another client. This
+extension has no command for deleting project banks; `/hindsight prune` only
+touches `sess-` banks.
+
+Old fork banks created under a folder name (`project-<folder>`, or
+`project-<namespace>-<folder>` when namespaced, in a subdirectory or worktree)
+are recall-only through the legacy fallback; new retains go to the repository
+bank (`project-<repo>` or `project-<namespace>-<repo>`).
 
 `project_bank_id` still works and pins one flat bank per machine for every
 project in project scope. In session scope it becomes the session-bank root
@@ -118,9 +125,11 @@ finds no bank; when no global bank answers, it retries on later runs instead of
 reporting a recall failure. The `sess-` prefix, `session_bank_ttl_days`, and
 `/hindsight prune [days] [--yes]` all exist for that mode.
 
-## Additions and divergences
+## Fork additions
 
-Fork additions:
+This fork includes upstream 1.5.2's API-key isolation, OS-keyring lookup,
+repository/worktree-aware project naming with legacy-bank recall, and the
+`PI_SUBAGENT_CHILD` guard. The fork-specific parts are:
 
 - Namespaced project banks (`bank_namespace`).
 - Session-scoped banks (`bank_scope = "session"`) and the `sess-` prefix.
@@ -132,21 +141,7 @@ Fork additions:
 - `/hindsight prune`. `/hindsight status` and `/hindsight doctor` already
   existed upstream.
 
-The fork is behind upstream 1.5.2 in these areas, so do not read this file as
-“upstream plus extras”:
-
-- Upstream 1.5.2 does not send the user's global/keyring API key to a
-  project-local `api_url`; this fork still merges the keys.
-- Upstream has OS-keyring API-key lookup; this fork reads `api_key` from config
-  only.
-- Upstream uses git-repository/worktree-aware project naming and recalls the
-  legacy folder-name bank; this fork uses the current directory basename and
-  reads only the namespaced bank.
-- Upstream disables the extension in `PI_SUBAGENT_CHILD` processes; this fork
-  does not.
-
-Sync when you want those changes (and expect conflicts in the bank-resolution
-code):
+Sync when upstream moves again (expect conflicts in the bank-resolution code):
 
 ```bash
 git remote add upstream https://github.com/anh-chu/pi-hindsight  # once per clone

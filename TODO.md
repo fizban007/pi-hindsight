@@ -20,9 +20,9 @@ version if this comparison is used for a decision.
 - Commands: `/hindsight [status|stats|settings|doctor|prune]`.
 - Config: flat `key = value` lines in `~/.hindsight/config` (no sections and no
   inline comments).
-- Banks: optional global bank + one project bank per directory (namespaced when
-  `bank_namespace` is set); or one session bank per session with
-  `bank_scope = session`.
+- Banks: optional global bank + one repository-aware project bank (namespaced
+  when `bank_namespace` is set; legacy folder-name bank read for recall); or
+  one session bank per session with `bank_scope = session`.
 - Per-prompt: `#nomem`/`#skip` at the start; `#global`/`#me`; custom `#tags`;
   trivial-prompt skip; project-level `recall_enabled`/`retain_enabled`.
 

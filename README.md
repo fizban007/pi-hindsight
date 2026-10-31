@@ -145,6 +145,8 @@ async_retain     = true
 
 Place a `.hindsight/config` file in the directory you run Pi from to override global settings. Local values win. The global config must still exist: the extension only reads project overrides after it has loaded `~/.hindsight/config`.
 
+If the project config sets an `api_url` that differs from the global one, your global, `HINDSIGHT_API_KEY` and keyring keys are not sent to it. Set `api_key` in the project config for that server. For the user's own `api_url`, the fallback order is project `api_key`, global `api_key`, `HINDSIGHT_API_KEY`, then the OS keyring (macOS Keychain service `hindsight`, Linux libsecret service `hindsight`).
+
 ```toml
 recall_types     = "observation,experience"
 recall_budget    = "low"
@@ -238,7 +240,7 @@ Or to disable home directory as a project:
 
 ### Project bank
 
-Named `project-<slug>`, where the slug is the current directory's basename, lowercased, reduced to `[a-z0-9-]`, and truncated to 32 characters (`/home/alex/.pi` → `pi`; the home directory itself → `home`). The bank is created on the first retained turn, not by recall. All turns are retained here by default, so each project builds its own isolated memory over time — but two different directories with the same basename on one machine share a bank, while a repository's worktrees and subdirectories get separate banks.
+Named `project-<slug>`, where the slug is the git repository's folder name when the cwd is inside git (so worktrees and subdirectories share the repository's bank), or the current directory's basename outside git. It is lowercased, reduced to `[a-z0-9-]`, and truncated to 32 characters (`/home/alex/.pi` → `pi`; the home directory itself → `home`). The bank is created on the first retained turn, not by recall. All turns are retained here by default, so each project builds its own isolated memory over time — but two different non-git directories with the same basename on one machine share a bank. The old folder-name bank for this config (`project-<folder>` or `project-<namespace>-<folder>`) is still read for recall; new retains go to the repository bank.
 
 When `bank_namespace` is set explicitly, the name becomes `project-<namespace>-<slug>` so machines sharing a server do not collide. With `bank_scope = session`, the project bank is not written to; it is only readable via `hindsight_recall`'s `bank` argument.
 

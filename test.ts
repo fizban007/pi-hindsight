@@ -918,6 +918,7 @@ describe("Retain async_retain config", () => {
 // ─── inferProjectMission tests ────────────────────────────────────────────────
 
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir, homedir } from "node:os";
 import { join as pathJoin, basename as pathBasename } from "node:path";
 
@@ -1580,6 +1581,33 @@ describe("session bank resolution", { skip: !extensionDepsInstalled && "extensio
     );
   });
 
+  test("project bank follows the git repository, not the subdirectory", () => {
+    const repo = mkdtempSync(pathJoin(tmpdir(), "hindsight-repo-"));
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: repo });
+      writeFileSync(pathJoin(repo, "README.md"), "hello\n");
+      execFileSync("git", ["add", "README.md"], { cwd: repo });
+      execFileSync(
+        "git",
+        ["-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-q", "-m", "init"],
+        { cwd: repo },
+      );
+      const sub = pathJoin(repo, "packages", "app");
+      mkdirSync(sub, { recursive: true });
+      const slug = mod.sanitizeBankSegment(pathBasename(repo));
+
+      assert.equal(mod.getProjectBank(cfg(), sub), `project-machine-a-${slug}`);
+      assert.ok(
+        mod.getLegacyProjectBanks(cfg(), sub).includes("project-machine-a-app"),
+        `legacy banks: ${mod.getLegacyProjectBanks(cfg(), sub).join(", ")}`,
+      );
+      assert.equal(mod.getProjectBank(cfg({ bank_namespace: undefined }), sub), `project-${slug}`);
+      assert.ok(mod.getLegacyProjectBanks(cfg({ bank_namespace: undefined }), sub).includes("project-app"));
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
   test("home directory uses a stable slug", () => {
     assert.equal(mod.getSessionBank(cfg(), SID_A, homedir()), "sess-machine-a-home-de30d68730cd");
   });
@@ -1972,5 +2000,37 @@ describe("retain report delivery", { skip: !extensionDepsInstalled && "extension
     assert.equal(pi.sentMessages.length, 1);
     assert.equal(pi.sentMessages[0].message.customType, "hindsight-retain-failed");
     assert.equal(pi.sentMessages[0].options.deliverAs, "nextTurn");
+  });
+});
+
+describe("resolveApiKey", { skip: !extensionDepsInstalled && "extension deps not installed (run npm ci)" }, () => {
+  let resolveApiKey: (global: Record<string, string>, local: Record<string, string>, env?: NodeJS.ProcessEnv) => string | undefined;
+
+  before(async () => {
+    ({ resolveApiKey } = await import("./index.ts"));
+  });
+
+  test("project api_key wins over global", () => {
+    assert.equal(resolveApiKey({ api_key: "global" }, { api_key: "project" }, {}), "project");
+  });
+
+  test("global api_key is used for the global api_url", () => {
+    assert.equal(resolveApiKey({ api_url: "https://mine", api_key: "global" }, {}, { HINDSIGHT_API_KEY: "env" }), "global");
+  });
+
+  test("falls back to HINDSIGHT_API_KEY for the user's own api_url", () => {
+    assert.equal(resolveApiKey({ api_url: "https://mine" }, {}, { HINDSIGHT_API_KEY: "env" }), "env");
+  });
+
+  test("project config repeating the global api_url still gets the user's key", () => {
+    assert.equal(resolveApiKey({ api_url: "https://mine", api_key: "global" }, { api_url: "https://mine" }, {}), "global");
+  });
+
+  test("never sends the global or env key to a project-chosen api_url", () => {
+    assert.equal(resolveApiKey({ api_url: "https://mine", api_key: "global" }, { api_url: "http://evil" }, { HINDSIGHT_API_KEY: "env" }), undefined);
+  });
+
+  test("a project-chosen api_url gets the project's own api_key", () => {
+    assert.equal(resolveApiKey({ api_url: "https://mine", api_key: "global" }, { api_url: "https://other", api_key: "project" }, {}), "project");
   });
 });

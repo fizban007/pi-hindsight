@@ -4,8 +4,9 @@
  */
 import { Text } from "@mariozechner/pi-tui";
 import { existsSync, readFileSync, appendFileSync, mkdirSync, writeFileSync } from "node:fs";
-import { join, basename } from "node:path";
-import { homedir, hostname } from "node:os";
+import { join, basename, dirname } from "node:path";
+import { homedir, hostname, userInfo } from "node:os";
+import { execFileSync } from "node:child_process";
 import { Type } from "@sinclair/typebox";
 // ---------------------------------------------------------------------------
 // Debug Logging
@@ -92,6 +93,42 @@ function parseConfigFile(filePath) {
     }
     return config;
 }
+/**
+ * API key from the OS keyring, for processes not started from a login shell (e.g. desktop
+ * apps that never see ~/.zshrc). macOS: Keychain item service "hindsight", account = OS
+ * user, read from the login keychain by path (SSH sessions don't search it by default).
+ * Linux: libsecret item `service=hindsight` (store with `secret-tool store --label
+ * Hindsight service hindsight`). Cached per process; empty when absent.
+ */
+let keychainApiKey;
+function readKeychainApiKey() {
+    if (keychainApiKey !== undefined)
+        return keychainApiKey || undefined;
+    const command = process.platform === "darwin"
+        ? ["security", ["find-generic-password", "-s", "hindsight", "-a", userInfo().username, "-w", join(homedir(), "Library", "Keychains", "login.keychain-db")]]
+        : process.platform === "linux"
+            ? ["secret-tool", ["lookup", "service", "hindsight"]]
+            : undefined;
+    try {
+        keychainApiKey = command
+            ? execFileSync(command[0], command[1], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5000 }).trim()
+            : "";
+    }
+    catch {
+        keychainApiKey = "";
+    }
+    return keychainApiKey || undefined;
+}
+/**
+ * The user's keys (global config, env, keyring) only go to a server the user chose.
+ * If a project's .hindsight/config points api_url somewhere else, only that project's
+ * own api_key is sent.
+ */
+export function resolveApiKey(global, local, env = process.env) {
+    if (local.api_url && local.api_url !== global.api_url)
+        return local.api_key;
+    return local.api_key || global.api_key || env.HINDSIGHT_API_KEY || readKeychainApiKey();
+}
 function getConfig() {
     try {
         const globalCfgPath = join(homedir(), ".hindsight", "config");
@@ -120,7 +157,7 @@ function getConfig() {
         const session_bank_ttl_days = merged.session_bank_ttl_days ? parseInt(merged.session_bank_ttl_days, 10) : undefined;
         return {
             api_url: merged.api_url,
-            api_key: merged.api_key,
+            api_key: resolveApiKey(global, local),
             global_bank: merged.global_bank,
             project_bank_id: merged.project_bank_id,
             recall_types,
@@ -314,10 +351,38 @@ export function getBankNamespace(config) {
     }
     return sanitizeBankSegment(hostname());
 }
+/**
+ * Project name for a directory: the main repository's folder name when inside
+ * git, so every worktree (e.g. ~/.t3/worktrees/<repo>/<branch>) and subfolder
+ * of a repo shares one bank on every machine. Outside git, or if git fails, the
+ * folder name is used.
+ */
+const projectNameCache = new Map();
+export function projectNameForCwd(cwd) {
+    const cached = projectNameCache.get(cwd);
+    if (cached)
+        return cached;
+    let name = basename(cwd);
+    try {
+        const [commonDir, topLevel] = execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir", "--show-toplevel"], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 3000 }).trim().split("\n");
+        // Normal repo or linked worktree: <main checkout>/.git. Bare repo with worktrees:
+        // <name>.git. Submodules and separate git dirs keep their git data elsewhere, so use
+        // their own checkout's folder name.
+        if (commonDir?.endsWith("/.git"))
+            name = basename(dirname(commonDir));
+        else if (commonDir?.endsWith(".git"))
+            name = basename(commonDir, ".git");
+        else if (topLevel)
+            name = basename(topLevel);
+    }
+    catch { }
+    projectNameCache.set(cwd, name);
+    return name;
+}
 export function getProjectSlug(cwd = sessionCwd) {
     if (cwd === homedir())
         return "home";
-    return sanitizeBankSegment(basename(cwd) || "/");
+    return sanitizeBankSegment(projectNameForCwd(cwd) || "/");
 }
 export function getSessionSuffix(sessionId) {
     const raw = (sessionId || "").trim();
@@ -337,16 +402,30 @@ function getBankRoot(config, cwd = sessionCwd) {
 export function getBankScope(config) {
     return config.bank_scope === "session" ? "session" : "project";
 }
-export function getProjectBank(config, cwd = sessionCwd) {
-    if (config?.project_bank_id)
-        return config.project_bank_id;
-    const slug = getProjectSlug(cwd);
-    // Project-scope naming stays byte-identical to older releases unless a
-    // namespace was configured explicitly. Session banks are always namespaced.
+function projectBankForSlug(config, slug) {
     if (!config || config.bank_namespace === undefined)
         return `project-${slug}`;
     const ns = getBankNamespace(config);
     return ns ? `project-${ns}-${slug}` : `project-${slug}`;
+}
+export function getProjectBank(config, cwd = sessionCwd) {
+    if (config?.project_bank_id)
+        return config.project_bank_id;
+    return projectBankForSlug(config, getProjectSlug(cwd));
+}
+/**
+ * Banks this directory may have used before project names followed the git
+ * repository. Recall still reads them so memories saved from a subfolder or
+ * worktree under the folder name stay reachable; new retains go to
+ * getProjectBank().
+ */
+export function getLegacyProjectBanks(config, cwd = sessionCwd) {
+    if (config?.project_bank_id)
+        return [];
+    const current = getProjectBank(config, cwd);
+    const legacySlug = cwd === homedir() ? "home" : sanitizeBankSegment(basename(cwd) || "/");
+    const legacy = projectBankForSlug(config, legacySlug);
+    return legacy === current ? [] : [legacy];
 }
 export function getSessionBank(config, sessionId = currentSessionId, cwd = sessionCwd) {
     return `sess-${getBankRoot(config, cwd)}-${getSessionSuffix(sessionId)}`;
@@ -376,6 +455,9 @@ export function getRecallBanks(config, sessionId = currentSessionId) {
     // Skip project bank in homedir when homedir_project is disabled
     if (!(isHomeDirSession() && config.homedir_project === false)) {
         banks.add(getProjectBank(config));
+        for (const legacy of getLegacyProjectBanks(config)) {
+            banks.add(legacy);
+        }
     }
     return Array.from(banks);
 }
@@ -688,7 +770,14 @@ async function fetchWithRateLimitRetry(url, options, label) {
     // unreachable, but satisfy TS
     throw new Error("unreachable");
 }
+export function isSubagentChildProcess(env = process.env) {
+    return env.PI_SUBAGENT_CHILD === "1";
+}
 export default function hindsightExtension(pi) {
+    if (isSubagentChildProcess()) {
+        log("extension disabled in PI_SUBAGENT_CHILD session");
+        return;
+    }
     let recallDone = false;
     let recallAttempts = 0;
     let retainSuccessCount = 0;
@@ -1163,6 +1252,8 @@ export default function hindsightExtension(pi) {
             transcript = transcript.slice(0, 50000) + "\n...[TRUNCATED]";
         }
         const banks = getRetainBanks(config, lastUserPrompt, sessionId);
+        // Home-dir session with homedir_project=false and no #global/#me: nothing to retain.
+        // Returning here keeps an empty bank list from being reported as a failed retain.
         if (banks.length === 0) {
             log("agent_settled: no retain banks, skipping");
             return;
@@ -1221,6 +1312,8 @@ export default function hindsightExtension(pi) {
                     retainSuccessCount,
                     retainEligibleCount,
                 });
+            }).catch((error) => {
+                log(`agent_settled: async retain failed: ${String(error)}`);
             });
             return;
         }
