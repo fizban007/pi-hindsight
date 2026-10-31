@@ -1761,7 +1761,7 @@ describe("hook-level session isolation", { skip: !extensionDepsInstalled && "ext
     assert.equal(retains[0].body.items[0].document_id, `session-${SID_A}`);
   });
 
-  test("a not-yet-created session bank is an empty vault, not a recall failure", async () => {
+  test("a not-yet-created session bank is retried, not reported as a recall failure", async () => {
     const defaultFetch = (global as any).fetch;
     const calls: string[] = [];
     (global as any).fetch = async (url: any, opts: any = {}) => {
@@ -1787,7 +1787,7 @@ describe("hook-level session isolation", { skip: !extensionDepsInstalled && "ext
       await pi.emit("before_agent_start", {}, ctx);
 
       const recalls = calls.filter(c => c.includes("/memories/recall"));
-      assert.equal(recalls.length, 1, "404 must not trigger the retry path");
+      assert.equal(recalls.length, 2, "404 must be retried once the bank may exist");
       assert.ok(
         !statuses.some(s => s.includes("recall failed") || s.includes("recall unavailable")),
         `unexpected failure status: ${statuses.join(", ")}`

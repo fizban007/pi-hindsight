@@ -62,7 +62,9 @@ function emitRetainReport(pi, ctx, outcome) {
         if (outcome.allFailed) {
             if (showStatus)
                 ctx.ui.setStatus("hindsight", badge);
-            pi.sendMessage({ customType: "hindsight-retain-failed", content: "", display: true }, { deliverAs: "nextTurn" });
+            if (feedback !== "none") {
+                pi.sendMessage({ customType: "hindsight-retain-failed", content: "", display: true }, { deliverAs: "nextTurn" });
+            }
             return;
         }
         ctx.ui.setStatus("hindsight", showStatus ? badge : undefined);
@@ -425,13 +427,13 @@ function getLastUserMessage(ctx, fallbackPrompt) {
 }
 async function getBankMission(config, bank) {
     try {
-        const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/profile`, {
+        const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/config`, {
             headers: { "Authorization": `Bearer ${config.api_key || ""}` }
         });
         if (!res.ok)
             return null;
         const data = await res.json();
-        return data.mission || null;
+        return data?.config?.reflect_mission || null;
     }
     catch (_) {
         return null;
@@ -439,12 +441,14 @@ async function getBankMission(config, bank) {
 }
 async function checkBankConfig(config, bank) {
     try {
-        const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/profile`, {
+        // The bank profile endpoint was removed in Hindsight 0.10; GET /config is
+        // the supported way to check that a bank exists and that auth works.
+        const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/config`, {
             headers: { "Authorization": `Bearer ${config.api_key || ""}` }
         });
-        if (res.status === 404) {
-            // Session banks are created on first retain. A 404 means the bank does
-            // not exist yet, not that auth or the server is broken.
+        if (res.status === 404 || res.status === 410) {
+            // Session banks are created on first retain. A missing bank means it
+            // does not exist yet, not that auth or the server is broken.
             return { ok: true, mission: null, missing: true };
         }
         if (res.status === 401 || res.status === 403)
@@ -452,7 +456,7 @@ async function checkBankConfig(config, bank) {
         if (!res.ok)
             return { ok: false, authError: false };
         const data = await res.json();
-        return { ok: true, mission: data.mission || null };
+        return { ok: true, mission: data?.config?.reflect_mission || null };
     }
     catch (_) {
         return { ok: false, authError: false };
@@ -899,7 +903,7 @@ export default function hindsightExtension(pi) {
             try {
                 const controller = new AbortController();
                 const timeout = setTimeout(() => controller.abort(), config.recall_timeout ?? 10000);
-                const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories/reflect`, {
+                const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/reflect`, {
                     method: "POST",
                     headers: {
                         "Content-Type": "application/json",
@@ -911,9 +915,9 @@ export default function hindsightExtension(pi) {
                 clearTimeout(timeout);
                 if (res.ok) {
                     const data = await res.json();
-                    return { content: [{ type: "text", text: data.synthesis || JSON.stringify(data) }], details: {} };
+                    return { content: [{ type: "text", text: data.text || JSON.stringify(data) }], details: {} };
                 }
-                return { content: [{ type: "text", text: "Failed to reflect." }], details: {}, isError: true };
+                return { content: [{ type: "text", text: `Failed to reflect (HTTP ${res.status}).` }], details: {}, isError: true };
             }
             catch (e) {
                 return { content: [{ type: "text", text: `Error: ${e}` }], details: {}, isError: true };
@@ -949,6 +953,8 @@ export default function hindsightExtension(pi) {
         log(`before_agent_start: querying banks=${banks.join(",")} prompt="${lastUserPrompt.slice(0, 80)}"`);
         try {
             let anyBankSucceeded = false;
+            let anyBankMissing = false;
+            let anyBankFailed = false;
             let authFailed = false;
             let rateLimitedFailed = false;
             const recallPromises = banks.map(async (bank) => {
@@ -977,12 +983,14 @@ export default function hindsightExtension(pi) {
                     if (res.status === 404) {
                         // A session bank is created by the first retain. Before that, the
                         // bank does not exist — that is an empty vault, not a failure, and
-                        // must not trigger the retry/backoff path.
-                        anyBankSucceeded = true;
-                        log(`before_agent_start: bank=${bank} does not exist yet (empty session bank)`);
+                        // not a completed recall either: retry once the first retain has
+                        // created it.
+                        anyBankMissing = true;
+                        log(`before_agent_start: bank=${bank} does not exist yet (waiting for first retain)`);
                         return [];
                     }
                     if (!res.ok) {
+                        anyBankFailed = true;
                         if (res.status === 401 || res.status === 403)
                             authFailed = true;
                         return [];
@@ -994,6 +1002,7 @@ export default function hindsightExtension(pi) {
                     return results;
                 }
                 catch (e) {
+                    anyBankFailed = true;
                     log(`before_agent_start: bank=${bank} error ${e}`);
                     return [];
                 }
@@ -1044,6 +1053,14 @@ export default function hindsightExtension(pi) {
                     hookStats.recall = { firedAt: new Date().toISOString(), result: "ok", detail: "vault empty" };
                     log("before_agent_start: no memories found (empty vault)");
                 }
+            }
+            else if (anyBankMissing && !anyBankFailed) {
+                // A not-yet-created bank is not a failed recall attempt: do not let it
+                // consume the retry budget before the first retain has created it.
+                recallAttempts = Math.max(0, recallAttempts - 1);
+                hookStats.recall = { firedAt: new Date().toISOString(), result: "ok", detail: "bank not created yet" };
+                ctx.ui.setStatus("hindsight", undefined);
+                log("before_agent_start: bank not created yet, will retry after the first retain");
             }
             else {
                 const isLastAttempt = recallAttempts >= MAX_RECALL_ATTEMPTS;
@@ -1144,6 +1161,10 @@ export default function hindsightExtension(pi) {
             transcript = transcript.slice(0, 50000) + "\n...[TRUNCATED]";
         }
         const banks = getRetainBanks(config, lastUserPrompt, sessionId);
+        if (banks.length === 0) {
+            log("agent_settled: no retain banks, skipping");
+            return;
+        }
         // Count this attempt (before the retain APIs)
         retainEligibleCount++;
         // Async retain: fire and forget, don't block
@@ -1364,6 +1385,7 @@ export default function hindsightExtension(pi) {
                     { key: "recall_types", label: "Recall Types", isBool: false, default: "observation" },
                     { key: "recall_budget", label: "Recall Budget", isBool: false, default: "mid" },
                     { key: "recall_max_tokens", label: "Max Tokens", isBool: false, default: "(default)" },
+                    { key: "recall_timeout", label: "Recall Timeout (ms)", isBool: false, default: "10000" },
                 ];
                 const DONE_LABEL = "← Done";
                 const buildOptions = () => {
