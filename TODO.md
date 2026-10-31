@@ -38,9 +38,11 @@ version if this comparison is used for a decision.
 - Bank strategies: `per-directory`, `git-branch`, `pi-session`, `per-repo`,
   `global`, `manual`; recommends one bank + tags/scopes.
 - Config: JSON (`.json`, also reads `.toml`) with global + project hierarchy.
-- Commands: 20+, including setup, status, doctor, where, config, connect,
-  stats, mode, sync, map, settings, profile, flush, popup, tag, remove-tag,
-  parse-session, and prune-recall-messages.
+- Commands: 22 registered in their extension code; 13 are documented in their
+  README (setup, status, doctor, where, profile, tag, remove-tag,
+  toggle-retain, popup, flush, parse-session, parse-and-upsert-session,
+  prune-recall-messages). The rest include config, connect, stats, mode, sync,
+  map, settings, inspect-last-recall, and upsert-historical-sessions.
 - Tools: `hindsight_search`, `hindsight_context`, `hindsight_retain`,
   `hindsight_bank_profile`.
 - Per-prompt: `#nomem`/`#skip` anywhere; `#global`/`#me`; `/hindsight:tag`;

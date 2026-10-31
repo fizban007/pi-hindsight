@@ -511,8 +511,10 @@ async function checkBankConfig(config: HindsightConfig, bank: string): Promise<
   | { ok: false; authError: boolean }
 > {
   try {
-    // The bank profile endpoint was removed in Hindsight 0.10; GET /config is
-    // the supported way to check that a bank exists and that auth works.
+    // Hindsight 0.10 removed the bank profile endpoints: /profile is still in
+    // the 1.1 spec marked "removed — use GET .../config" but returns 410.
+    // GET /config is the supported way to check that a bank exists and that
+    // auth works.
     const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/config`, {
       headers: { "Authorization": `Bearer ${config.api_key || ""}` }
     });

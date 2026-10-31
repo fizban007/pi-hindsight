@@ -27,7 +27,7 @@ Tested against a self-hosted Hindsight server (2 vCPU / 8 GB RAM) backed by Supa
 ```toml
 # ~/.hindsight/config
 # high adds instability with no latency benefit
-recall_budget = mid
+recall_budget = "mid"
 # reduces context injection noise; no latency impact
 recall_max_tokens = 512
 ```
