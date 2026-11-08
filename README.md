@@ -138,6 +138,7 @@ global_bank      = "sil"
 recall_types     = "observation"
 recall_budget    = "mid"
 recall_max_tokens = 800
+recall_min_score = 0.25
 async_retain     = true
 ```
 
@@ -160,7 +161,9 @@ recall_max_tokens = 512
 | `recall_types` | `observation` | Memory types to search: `observation`, `world`, `experience`. Comma-separated. Each type runs the full retrieval pipeline independently. |
 | `recall_budget` | `mid` | Retrieval depth: `low`, `mid`, `high`. Higher = more coverage but added latency. |
 | `recall_max_tokens` | Server default (4096) | Max tokens for injected memories. Lower values reduce context noise. Recommended: `800`. |
-| `recall_timeout` | `10000` | Per-request timeout in milliseconds, also used by `hindsight_reflect`. A bank that misses it is treated as empty for that run rather than blocking indefinitely; 429 backoff retries can extend the wait. Lower it when the server is remote and slow. |
+| `recall_min_score` | `0.25` | Reranker floor (`0`-`1`) for recall. Results below it are dropped by the server after reranking, and a bank with nothing above it returns no results at all, so an unrelated prompt injects nothing instead of filling the token budget with the least-bad memories. Relevant prompts score `0.6`-`1.0` and unrelated ones `~1e-5` on an ordinary project bank, so the default sits far from both edges. Set `0` to disable. Not calibrated across queries — lower it if a prompt you expect to hit memory comes back empty. |
+| `recall_timeout` | `10000` | Per-request timeout in milliseconds for recall. A bank that misses it is treated as empty for that run rather than blocking indefinitely; 429 backoff retries can extend the wait. Lower it when the server is remote and slow. Does not affect `hindsight_reflect` — see `reflect_timeout`. |
+| `reflect_timeout` | `60000` | Timeout in milliseconds for `hindsight_reflect`. Reflect is an agentic loop of up to ten LLM rounds over the bank, so it routinely takes 10-25s on a project bank — far longer than the recall deadline it used to share. Raise it on slow servers or large banks; lower it if you would rather give up early. |
 | `async_retain` | `true` | Fire-and-forget retain. Set `false` to wait for the server to accept the write before the run settles. Hindsight still processes the retain asynchronously either way; extraction failures are not reported by this extension. |
 | `retain_feedback` | `status` | How retain results are reported: `status` (badge only), `message` (chat message only), `both`, or `none` (suppresses both success and failure messages). |
 | `project_bank_id` | _(none)_ | Pins one flat bank for every project on this machine (project scope). Overrides the `project-<slug>` derivation. In session scope it becomes the session-bank root (`sess-<project_bank_id>-<tail>`). Prefer `bank_namespace` unless you really want all projects sharing one vault. |
@@ -184,6 +187,7 @@ Banks can also be steered from the environment, using the same variables omp rea
 | `HINDSIGHT_SCOPING=global` | Additionally replaces `global_bank` with `HINDSIGHT_BANK_ID`, collapsing recall + retain into one flat bank per agent (same semantics as omp's `global` scoping). Also pins the exact bank, disabling session scope. |
 | `HINDSIGHT_SCOPING=per-project` / `per-project-tagged` | Pins project scoping; the configured `global_bank` stays in the recall mix. pi-hindsight has no tag-scoped scoping, so omp's per-project-tagged behavior (same bank with project tags) is approximated, not replicated. |
 | `HINDSIGHT_RETAIN_EVERY_N_TURNS` | Ignored — omp-only. Retention runs at `agent_settled` on every settled turn. |
+| `HINDSIGHT_RECALL_TIMEOUT` / `HINDSIGHT_REFLECT_TIMEOUT` | Override `recall_timeout` / `reflect_timeout`, in milliseconds. Applied whether or not a bank is pinned. |
 
 Precedence: environment > project config > global config > `project-<slug>` default. Without `HINDSIGHT_BANK_ID` the environment still applies `HINDSIGHT_BANK_SCOPE` / `HINDSIGHT_BANK_NAMESPACE`; other config-driven setups are unaffected. `HINDSIGHT_DEBUG=1` turns on debug logging (see below).
 
@@ -313,7 +317,7 @@ This compares the current fork with `@walodayeet/hindsight-pi` 0.4.x. This secti
 | Injection frequency | Implicit: once per session, re-armed by compaction/resume | Explicit: `every-turn` (default) or `first-turn` for continue-style prompts |
 | Recall modes | Auto-inject + manual tools; auto-recall can be disabled per project | `hybrid`, `context`, `tools`, or `off` |
 | Banks | Project or session bank, plus `global_bank` when configured | Primary bank + optional `globalBankId`, tags/scopes, linked hosts |
-| Recall types / budget | `recall_types` (default `observation`), `recall_budget`, `recall_max_tokens` | `recallTypes` + `recallPerType`, `searchBudget`, `contextTokens` |
+| Recall types / budget | `recall_types` (default `observation`), `recall_budget`, `recall_max_tokens`, `recall_min_score` | `recallTypes` + `recallPerType`, `searchBudget`, `contextTokens` |
 | Retry on failure | Up to 3 failed attempts across runs; a missing bank is retried when no other bank answers | No recall retry |
 
 **What the differences mean:**

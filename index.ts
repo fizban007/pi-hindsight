@@ -110,7 +110,7 @@ function emitRetainReport(
 // Config & Helpers
 // ---------------------------------------------------------------------------
 
-interface HindsightConfig {
+export interface HindsightConfig {
   api_url?: string;
   api_key?: string;
   global_bank?: string;
@@ -118,7 +118,9 @@ interface HindsightConfig {
   recall_types?: string[];
   recall_budget?: string;
   recall_max_tokens?: number;
+  recall_min_score?: number;
   recall_timeout?: number;
+  reflect_timeout?: number;
   async_retain?: boolean;
   retain_feedback?: "message" | "status" | "both" | "none";
   recall_enabled?: boolean;
@@ -127,6 +129,65 @@ interface HindsightConfig {
   bank_scope?: "project" | "session";
   bank_namespace?: string;
   session_bank_ttl_days?: number;
+}
+
+/**
+ * Recall and reflect are different shapes of work, so they get different
+ * deadlines. Recall is four retrieval arms plus a rerank (a few seconds at
+ * budget=low on a self-hosted server). Reflect is an agentic loop of up to ten
+ * LLM rounds over the bank; measured 10-22s on an ordinary project bank. A
+ * shared 10s deadline aborted most reflects, so reflect defaults to a minute.
+ */
+export const RECALL_TIMEOUT_DEFAULT_MS = 10_000;
+export const REFLECT_TIMEOUT_DEFAULT_MS = 60_000;
+
+export function getReflectTimeoutMs(config: HindsightConfig): number {
+  return config.reflect_timeout ?? REFLECT_TIMEOUT_DEFAULT_MS;
+}
+
+export function getRecallTimeoutMs(config: HindsightConfig): number {
+  return config.recall_timeout ?? RECALL_TIMEOUT_DEFAULT_MS;
+}
+
+/**
+ * Reranker floor for recall. Recall fuses four retrieval arms and returns
+ * whatever they surface, so without a floor an unrelated prompt still fills the
+ * whole `max_tokens` budget with the least-bad memories in the bank. The server's
+ * `min_scores.reranker` is applied to every result after fusion and reranking, so
+ * a bank with nothing above the floor returns no results at all and the extension
+ * injects nothing. `0` disables the floor.
+ *
+ * Measured on an ordinary project bank: relevant prompts score 0.6-1.0, unrelated
+ * ones ~1e-5, so the default sits far from both edges. The reranker is not
+ * calibrated across queries, hence a low default rather than a high one.
+ */
+export const RECALL_MIN_SCORE_DEFAULT = 0.25;
+
+export function getRecallMinScore(config: HindsightConfig): number {
+  const value = config.recall_min_score;
+  return typeof value === "number" && Number.isFinite(value) ? value : RECALL_MIN_SCORE_DEFAULT;
+}
+
+/**
+ * Body for `POST /v1/default/banks/<bank>/memories/recall`.
+ *
+ * `min_scores.reranker` is the only floor that makes recall abstain: it is a
+ * per-result predicate applied after fusion and reranking. `semantic`/`keyword`
+ * floors are per-retrieval-arm cutoffs, and results reached through the graph or
+ * temporal arm carry neither score, so those floors cannot express "nothing here
+ * is relevant".
+ */
+export function buildRecallBody(query: string, config: HindsightConfig): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    query,
+    budget: config.recall_budget,
+    query_timestamp: new Date().toISOString(),
+    types: config.recall_types,
+  };
+  if (config.recall_max_tokens !== undefined) body.max_tokens = config.recall_max_tokens;
+  const minScore = getRecallMinScore(config);
+  if (minScore > 0) body.min_scores = { reranker: minScore };
+  return body;
 }
 
 function parseConfigFile(filePath: string): Record<string, string> {
@@ -198,7 +259,11 @@ function getConfig(): HindsightConfig | null {
       : ["observation"];
     const recall_budget = merged.recall_budget || "mid";
     const recall_max_tokens = merged.recall_max_tokens ? parseInt(merged.recall_max_tokens, 10) : undefined;
+    const recall_min_score = merged.recall_min_score !== undefined && merged.recall_min_score !== ""
+      ? parseFloat(merged.recall_min_score)
+      : undefined;
     const recall_timeout = merged.recall_timeout ? parseInt(merged.recall_timeout, 10) : undefined;
+    const reflect_timeout = merged.reflect_timeout ? parseInt(merged.reflect_timeout, 10) : undefined;
     const async_retain = merged.async_retain === "false" ? false : true;
     const retain_feedback: "message" | "status" | "both" | "none" = (merged.retain_feedback as any) || "status";
     const recall_enabled = merged.recall_enabled === "false" ? false : true;
@@ -215,7 +280,9 @@ function getConfig(): HindsightConfig | null {
       recall_types,
       recall_budget,
       recall_max_tokens,
+      recall_min_score,
       recall_timeout,
+      reflect_timeout,
       async_retain,
       retain_feedback,
       recall_enabled,
@@ -350,6 +417,15 @@ function getConfigWithSource(): { global: Record<string, string>; local: Record<
 export function applyEnvOverrides(merged: Record<string, string>): void {
   const scope = process.env.HINDSIGHT_BANK_SCOPE?.trim();
   if (scope === "session" || scope === "project") merged.bank_scope = scope;
+
+  // Timeouts are not bank identity, so they apply whether or not a bank is
+  // pinned below.
+  const recallTimeout = process.env.HINDSIGHT_RECALL_TIMEOUT?.trim();
+  if (recallTimeout) merged.recall_timeout = recallTimeout;
+  const reflectTimeout = process.env.HINDSIGHT_REFLECT_TIMEOUT?.trim();
+  if (reflectTimeout) merged.reflect_timeout = reflectTimeout;
+  const recallMinScore = process.env.HINDSIGHT_RECALL_MIN_SCORE?.trim();
+  if (recallMinScore) merged.recall_min_score = recallMinScore;
 
   if (process.env.HINDSIGHT_BANK_NAMESPACE !== undefined) {
     merged.bank_namespace = process.env.HINDSIGHT_BANK_NAMESPACE.trim();
@@ -1015,10 +1091,9 @@ export default function hindsightExtension(pi: ExtensionAPI) {
       const banks = explicitBank ? [explicitBank] : getRecallBanks(config, sessionId);
       try {
         const recallPromises = banks.map(async (bank) => {
-          const reqBody: Record<string, any> = { query, budget: config.recall_budget, query_timestamp: new Date().toISOString(), types: config.recall_types };
-          if (config.recall_max_tokens !== undefined) reqBody.max_tokens = config.recall_max_tokens;
+          const reqBody = buildRecallBody(query, config);
           const controller = new AbortController();
-          const timeout = setTimeout(() => controller.abort(), config.recall_timeout ?? 10000);
+          const timeout = setTimeout(() => controller.abort(), getRecallTimeoutMs(config));
           try {
             const { res, rateLimitExhausted } = await fetchWithRateLimitRetry(
               `${config.api_url}/v1/default/banks/${bank}/memories/recall`,
@@ -1115,7 +1190,8 @@ export default function hindsightExtension(pi: ExtensionAPI) {
         : getProjectBank(config);
       try {
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), config.recall_timeout ?? 10000);
+        const timeoutMs = getReflectTimeoutMs(config);
+        const timeout = setTimeout(() => controller.abort(), timeoutMs);
         const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/reflect`, {
           method: "POST",
           headers: {
@@ -1131,8 +1207,15 @@ export default function hindsightExtension(pi: ExtensionAPI) {
           return { content: [{ type: "text" as const, text: data.text || JSON.stringify(data) }], details: {} };
         }
         return { content: [{ type: "text" as const, text: `Failed to reflect (HTTP ${res.status}).` }], details: {}, isError: true };
-      } catch (e) {
-        return { content: [{ type: "text" as const, text: `Error: ${e}` }], details: {}, isError: true };
+      } catch (e: any) {
+        // A bare AbortError reads like a network fault. Say what actually
+        // happened and which knob moves the deadline.
+        const aborted = e?.name === "AbortError" || e?.name === "TimeoutError";
+        const text = aborted
+          ? `Reflect timed out after ${getReflectTimeoutMs(config)}ms. Reflect is an agentic loop (up to ten LLM rounds), so it needs more than the recall timeout — raise \`reflect_timeout\` in ~/.hindsight/config.`
+          : `Error: ${e}`;
+        log(`hindsight_reflect: bank=${bank} error ${e}`);
+        return { content: [{ type: "text" as const, text }], details: {}, isError: true };
       }
     }
   });
@@ -1176,13 +1259,12 @@ export default function hindsightExtension(pi: ExtensionAPI) {
       let authFailed = false;
       let rateLimitedFailed = false;
       const recallPromises = banks.map(async (bank) => {
-        const reqBody: Record<string, any> = { query: lastUserPrompt, budget: config.recall_budget, query_timestamp: new Date().toISOString(), types: config.recall_types };
-        if (config.recall_max_tokens !== undefined) reqBody.max_tokens = config.recall_max_tokens;
+        const reqBody = buildRecallBody(lastUserPrompt, config);
         const controller = new AbortController();
         const timeout = setTimeout(() => {
           controller.abort();
           log(`before_agent_start: bank=${bank} timed out`);
-        }, config.recall_timeout ?? 10000);
+        }, getRecallTimeoutMs(config));
         try {
           const { res, rateLimitExhausted } = await fetchWithRateLimitRetry(
             `${config.api_url}/v1/default/banks/${bank}/memories/recall`,
@@ -1272,8 +1354,9 @@ export default function hindsightExtension(pi: ExtensionAPI) {
             }
           };
         } else {
-          hookStats.recall = { firedAt: new Date().toISOString(), result: "ok", detail: "vault empty" };
-          log("before_agent_start: no memories found (empty vault)");
+          const floor = getRecallMinScore(config);
+          hookStats.recall = { firedAt: new Date().toISOString(), result: "ok", detail: "nothing above recall floor" };
+          log(`before_agent_start: no memories above the recall floor (min_score=${floor}, or empty vault)`);
         }
       } else if (anyBankMissing && !anyBankFailed) {
         // A not-yet-created bank is not a failed recall attempt: do not let it
@@ -1625,7 +1708,9 @@ export default function hindsightExtension(pi: ExtensionAPI) {
           { key: "recall_types", label: "Recall Types", isBool: false, default: "observation" },
           { key: "recall_budget", label: "Recall Budget", isBool: false, default: "mid" },
           { key: "recall_max_tokens", label: "Max Tokens", isBool: false, default: "(default)" },
+          { key: "recall_min_score", label: "Min Reranker Score", isBool: false, default: "0.25" },
           { key: "recall_timeout", label: "Recall Timeout (ms)", isBool: false, default: "10000" },
+          { key: "reflect_timeout", label: "Reflect Timeout (ms)", isBool: false, default: "60000" },
         ];
 
         const DONE_LABEL = "← Done";

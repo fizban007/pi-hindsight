@@ -30,6 +30,8 @@ Tested against a self-hosted Hindsight server (2 vCPU / 8 GB RAM) backed by Supa
 recall_budget = "mid"
 # reduces context injection noise; no latency impact
 recall_max_tokens = 512
+# abstain instead of injecting the least-bad memories (0 disables)
+recall_min_score = 0.25
 ```
 
 ## What causes recall latency

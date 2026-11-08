@@ -733,6 +733,21 @@ describe("Recall request shape", () => {
     const recall_timeout = (config as any).recall_timeout ?? 10000;
     assert.equal(recall_timeout, 10000, "should default to 10000ms");
   });
+
+  test("reflect_timeout defaults to 60000 and is independent of recall_timeout", async () => {
+    const defaults = { api_url: "http://localhost:8888", api_key: "k" } as any;
+    assert.equal(defaults.reflect_timeout ?? 60000, 60000, "reflect should default to 60000ms");
+    assert.equal(defaults.recall_timeout ?? 10000, 10000, "recall should stay at 10000ms");
+
+    // Reflect is an agentic loop; a configured recall timeout must not shrink it.
+    const config = { api_url: "http://localhost:8888", api_key: "k", recall_timeout: 5000 } as any;
+    assert.equal(config.reflect_timeout ?? 60000, 60000, "recall_timeout must not govern reflect");
+  });
+
+  test("configured reflect_timeout is used as-is", async () => {
+    const config = { api_url: "http://localhost:8888", api_key: "k", reflect_timeout: 90000 } as any;
+    assert.equal(config.reflect_timeout ?? 60000, 90000);
+  });
 });
 
 describe("Retain request shape", () => {
@@ -1514,6 +1529,170 @@ describe("applyEnvOverrides", { skip: !extensionDepsInstalled && "extension deps
     const merged = env("  agent-bank  ", "global");
     assert.equal(merged.project_bank_id, "agent-bank");
     assert.equal(merged.global_bank, "");
+  });
+
+  test("HINDSIGHT_RECALL_MIN_SCORE overrides the configured floor", () => {
+    const merged: Record<string, string> = { api_url: "http://x", recall_min_score: "0.4" };
+    process.env.HINDSIGHT_RECALL_MIN_SCORE = "0.5";
+    try {
+      applyEnvOverrides(merged);
+      assert.equal(merged.recall_min_score, "0.5");
+    } finally {
+      delete process.env.HINDSIGHT_RECALL_MIN_SCORE;
+    }
+  });
+});
+
+describe("recall relevance floor", { skip: !extensionDepsInstalled && "extension deps not installed (run npm ci)" }, () => {
+  let mod: any;
+
+  before(async () => {
+    mod = await import("./index.ts");
+  });
+
+  test("defaults to 0.25", () => {
+    assert.equal(mod.RECALL_MIN_SCORE_DEFAULT, 0.25);
+    assert.equal(mod.getRecallMinScore({}), 0.25);
+    assert.equal(mod.getRecallMinScore({ recall_min_score: undefined }), 0.25);
+    assert.equal(mod.getRecallMinScore({ recall_min_score: Number.NaN }), 0.25);
+  });
+
+  test("sends min_scores.reranker so recall can abstain", () => {
+    const body: any = mod.buildRecallBody("what did we decide?", {
+      api_url: "http://x",
+      recall_budget: "mid",
+      recall_max_tokens: 800,
+    });
+    assert.deepEqual(body.min_scores, { reranker: 0.25 });
+    assert.equal(body.budget, "mid");
+    assert.equal(body.max_tokens, 800);
+    assert.equal(body.query, "what did we decide?");
+  });
+
+  test("a configured floor replaces the default", () => {
+    const body: any = mod.buildRecallBody("q", { api_url: "http://x", recall_min_score: 0.4 });
+    assert.deepEqual(body.min_scores, { reranker: 0.4 });
+  });
+
+  test("0 disables the floor entirely", () => {
+    const body: any = mod.buildRecallBody("q", { api_url: "http://x", recall_min_score: 0 });
+    assert.equal(body.min_scores, undefined, "no min_scores key when the floor is off");
+    assert.equal(mod.getRecallMinScore({ recall_min_score: 0 }), 0);
+  });
+});
+
+describe("recall floor from config", { skip: !extensionDepsInstalled && "extension deps not installed (run npm ci)" }, () => {
+  let fakeHome: string;
+  let originalHome: string | undefined;
+  let recorded: { url: string; body: any }[];
+  let hindsightExtension: any;
+
+  const SID = "01a18aa6-cf2c-71a6-8b67-de30d68730cd";
+
+  function writeConfig(extra: string[] = []) {
+    writeFileSync(
+      pathJoin(fakeHome, ".hindsight", "config"),
+      [
+        'api_url = "http://fake-hindsight"',
+        'api_key = "test-key"',
+        'bank_scope = "project"',
+        'bank_namespace = "testbox"',
+        "recall_max_tokens = 800",
+        ...extra,
+      ].join("\n") + "\n"
+    );
+  }
+
+  function makeSessionCtx(prompt: string) {
+    return {
+      cwd: process.cwd(),
+      sessionManager: {
+        getSessionId: () => SID,
+        getEntries: () => (prompt ? [{ type: "message", message: { role: "user", content: prompt } }] : []),
+      },
+      ui: { setStatus() {}, notify() {} },
+    };
+  }
+
+  async function recallTurn(prompt: string) {
+    const pi = makePiMock();
+    hindsightExtension(pi);
+    const ctx = makeSessionCtx(prompt);
+    await pi.emit("session_start", {}, ctx);
+    const before = recorded.length;
+    const result = await pi.emit("before_agent_start", {}, ctx);
+    const recalls = recorded
+      .slice(before)
+      .filter(r => r.url.includes("/memories/recall"));
+    return { result, recalls };
+  }
+
+  before(async () => {
+    originalHome = process.env.HOME;
+    fakeHome = mkdtempSync(pathJoin(tmpdir(), "hindsight-floor-test-"));
+    mkdirSync(pathJoin(fakeHome, ".hindsight"), { recursive: true });
+    writeConfig();
+    process.env.HOME = fakeHome;
+    delete process.env.HINDSIGHT_RECALL_MIN_SCORE;
+
+    (global as any).fetch = async (url: any, opts: any = {}) => {
+      let parsed: any;
+      try { parsed = opts.body ? JSON.parse(opts.body) : undefined; } catch { parsed = opts.body; }
+      recorded.push({ url: String(url), body: parsed });
+      return { ok: true, status: 200, json: async () => ({ results: [{ text: "a memory" }] }) };
+    };
+
+    ({ default: hindsightExtension } = await import("./index.ts"));
+  });
+
+  beforeEach(() => {
+    recorded = [];
+    delete process.env.HINDSIGHT_RECALL_MIN_SCORE;
+  });
+
+  after(() => {
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+    delete process.env.HINDSIGHT_RECALL_MIN_SCORE;
+    rmSync(fakeHome, { recursive: true, force: true });
+  });
+
+  test("unconfigured floor is 0.25 in the request body", async () => {
+    writeConfig();
+    const { result, recalls } = await recallTurn("how does auth work?");
+    assert.ok(recalls.length > 0, "recall should hit the server");
+    assert.deepEqual(recalls[0].body.min_scores, { reranker: 0.25 });
+    assert.equal(recalls[0].body.max_tokens, 800);
+    assert.ok(result?.message?.content.includes("a memory"), "memories still inject when the floor is met");
+  });
+
+  test("configured floor is parsed from the config file", async () => {
+    writeConfig(["recall_min_score = 0.4"]);
+    const { recalls } = await recallTurn("how does auth work?");
+    assert.deepEqual(recalls[0].body.min_scores, { reranker: 0.4 });
+  });
+
+  test("recall_min_score = 0 omits min_scores", async () => {
+    writeConfig(["recall_min_score = 0"]);
+    const { recalls } = await recallTurn("how does auth work?");
+    assert.equal(recalls[0].body.min_scores, undefined);
+  });
+
+  test("an empty result set injects nothing", async () => {
+    writeConfig();
+    const realFetch = (global as any).fetch;
+    (global as any).fetch = async (url: any, opts: any = {}) => {
+      let parsed: any;
+      try { parsed = opts.body ? JSON.parse(opts.body) : undefined; } catch { parsed = opts.body; }
+      recorded.push({ url: String(url), body: parsed });
+      return { ok: true, status: 200, json: async () => ({ results: [] }) };
+    };
+    try {
+      const { result } = await recallTurn("what is the capital of Mongolia");
+      assert.equal(result, undefined, "no message when nothing clears the floor");
+    } finally {
+      (global as any).fetch = realFetch;
+    }
   });
 });
 

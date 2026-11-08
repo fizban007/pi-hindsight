@@ -138,6 +138,17 @@ repository/worktree-aware project naming with legacy-bank recall, and the
   omp-compatible.
 - `hindsight_recall` accepts an optional `bank` argument to read a bank outside
   the current recall set.
+- A separate `reflect_timeout` (default `60000`, env `HINDSIGHT_REFLECT_TIMEOUT`)
+  instead of making reflect share the 10s `recall_timeout`. Upstream uses one
+  deadline for both, which aborted most reflects: measured 22s, 10.5s and 16.3s
+  against a live 1.1.0 server on a normal project bank. Recall stays at 10s.
+- A `recall_min_score` reranker floor (default `0.25`, env
+  `HINDSIGHT_RECALL_MIN_SCORE`) sent as `min_scores.reranker`. Upstream sends no
+  score floor and the server applies none by default, so recall always returns
+  something: an unrelated prompt still filled the whole token budget with the
+  least-bad memories in the bank. Measured on a project bank, relevant prompts
+  scored 0.6-1.0 and unrelated ones `~1e-5`, so recall now abstains instead of
+  injecting noise. `0` disables the floor.
 - `/hindsight prune`. `/hindsight status` and `/hindsight doctor` already
   existed upstream.
 
