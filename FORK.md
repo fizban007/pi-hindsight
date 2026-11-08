@@ -1,8 +1,8 @@
 # This fork
 
 Public fork of [anh-chu/pi-hindsight](https://github.com/anh-chu/pi-hindsight).
-The fork is based on upstream `1.5.2`; it can track upstream and send pull
-requests from here. A fresh clone has only `origin` — add the upstream remote
+The fork tracks upstream, currently at `1.6.0`, and can send pull requests
+from here. A fresh clone has only `origin` — add the upstream remote
 when you want to sync:
 
 ```bash
@@ -127,8 +127,9 @@ reporting a recall failure. The `sess-` prefix, `session_bank_ttl_days`, and
 
 ## Fork additions
 
-This fork includes upstream 1.5.2's API-key isolation, OS-keyring lookup,
-repository/worktree-aware project naming with legacy-bank recall, and the
+This fork includes upstream 1.6.0's API-key isolation, OS-keyring lookup,
+repository/worktree-aware project naming with legacy-bank recall,
+`retain_tags` / `observation_scopes` for shared banks, and the
 `PI_SUBAGENT_CHILD` guard. The fork-specific parts are:
 
 - Namespaced project banks (`bank_namespace`).
