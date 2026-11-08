@@ -174,6 +174,8 @@ recall_max_tokens = 512
 | `bank_namespace` | hostname for session banks; unset for project banks | Machine identity embedded in bank ids. Set it explicitly to get `project-<namespace>-<slug>` project banks. With no value, project banks keep the legacy `project-<slug>` name and machines sharing a server can collide. Set it to an empty string to omit the namespace from session banks too (only safe if one machine uses the server). |
 | `session_bank_ttl_days` | `30` | Default age for `/hindsight prune` when no day count is given. |
 | `global_bank` | _(none)_ | Bank ID for cross-project memory. When set, it is queried on the first successful recall of a session (and by manual `hindsight_recall`), alongside the project or session bank. Turns tagged `#global` or `#me` are also retained here. `hindsight_reflect` does not read it. Leave unset if you only want per-project memory. |
+| `retain_tags` | _(none)_ | Static tags attached to every retained memory, comma-separated (e.g. `agent:my-laptop`). Merged with per-prompt `#hashtags` (static first, deduplicated). Useful when several agents share one bank and you want to scope recall by agent. |
+| `observation_scopes` | _(none)_ | Passed through to the Hindsight retain API on every retained memory. Set `per_tag` to keep each tag's consolidated observations isolated — see Hindsight's multi-agent shared-bank docs. |
 
 ### Environment variable overrides
 
@@ -184,12 +186,13 @@ Banks can also be steered from the environment, using the same variables omp rea
 | `HINDSIGHT_BANK_ID` | Replaces the bank root. With `bank_scope = session` it is the root that session banks are derived from (`sess-<root>-<tail>`); with `bank_scope = project` it is the exact bank. Also overrides any `project_bank_id` config key. |
 | `HINDSIGHT_BANK_SCOPE` | `session` or `project` — overrides `bank_scope`. |
 | `HINDSIGHT_BANK_NAMESPACE` | Overrides `bank_namespace`. |
+| `HINDSIGHT_RETAIN_TAGS` | Overrides `retain_tags` (env beats config, same as `HINDSIGHT_BANK_ID`). Lets a launcher stamp a per-deployment identity tag without writing config files. |
 | `HINDSIGHT_SCOPING=global` | Additionally replaces `global_bank` with `HINDSIGHT_BANK_ID`, collapsing recall + retain into one flat bank per agent (same semantics as omp's `global` scoping). Also pins the exact bank, disabling session scope. |
 | `HINDSIGHT_SCOPING=per-project` / `per-project-tagged` | Pins project scoping; the configured `global_bank` stays in the recall mix. pi-hindsight has no tag-scoped scoping, so omp's per-project-tagged behavior (same bank with project tags) is approximated, not replicated. |
 | `HINDSIGHT_RETAIN_EVERY_N_TURNS` | Ignored — omp-only. Retention runs at `agent_settled` on every settled turn. |
 | `HINDSIGHT_RECALL_TIMEOUT` / `HINDSIGHT_REFLECT_TIMEOUT` | Override `recall_timeout` / `reflect_timeout`, in milliseconds. Applied whether or not a bank is pinned. |
 
-Precedence: environment > project config > global config > `project-<slug>` default. Without `HINDSIGHT_BANK_ID` the environment still applies `HINDSIGHT_BANK_SCOPE` / `HINDSIGHT_BANK_NAMESPACE`; other config-driven setups are unaffected. `HINDSIGHT_DEBUG=1` turns on debug logging (see below).
+Precedence: environment > project config > global config > `project-<slug>` default. Without `HINDSIGHT_BANK_ID` the environment still applies `HINDSIGHT_BANK_SCOPE` / `HINDSIGHT_BANK_NAMESPACE` / `HINDSIGHT_RETAIN_TAGS`; other config-driven setups are unaffected. `HINDSIGHT_DEBUG=1` turns on debug logging (see below).
 
 An explicit `HINDSIGHT_BANK_ID` is also active in the home directory, even when `homedir_project` is `false`.
 
@@ -259,6 +262,25 @@ Optional. Set `global_bank = <bank-id>` in your config to enable it. The global 
 On the first successful recall of a session, both banks are queried in parallel and their results are merged into a single injection. You get project-specific context and cross-project context together, with no duplicated queries. `hindsight_reflect` reads only the project or session bank.
 
 Turns are retained to the global bank only when you explicitly tag the prompt with `#global` or `#me`. Everything else goes to the project bank only, keeping global memory intentional.
+
+### Sharing a bank across multiple agents
+
+Several agents (or several machines running Pi) can write into the same bank. To keep memories attributable, give each deployment a static identity tag with `retain_tags`:
+
+```ini
+retain_tags = "agent:my-laptop"
+observation_scopes = "per_tag"
+```
+
+Every retained memory — auto-retain and the manual `hindsight_retain` tool — then carries `agent:my-laptop` alongside any per-prompt `#hashtags`. On the recall side, other Hindsight clients can scope queries with `tags=["agent:my-laptop"]` and `tags_match="any_strict"` to see only that agent's memories, or query unfiltered for the cross-agent view.
+
+`observation_scopes = "per_tag"` is passed through to the server so each tag's consolidated observations stay isolated instead of blending across agents (see Hindsight's multi-agent shared-bank documentation).
+
+Launchers can stamp the identity per deployment without config files:
+
+```bash
+HINDSIGHT_BANK_ID=team-memory HINDSIGHT_RETAIN_TAGS="agent:pi-build01" pi
+```
 
 ## Debug logging
 

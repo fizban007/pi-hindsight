@@ -1464,12 +1464,13 @@ describe("applyEnvOverrides", { skip: !extensionDepsInstalled && "extension deps
     delete process.env.HINDSIGHT_SCOPING;
     delete process.env.HINDSIGHT_BANK_SCOPE;
     delete process.env.HINDSIGHT_BANK_NAMESPACE;
+    delete process.env.HINDSIGHT_RETAIN_TAGS;
   });
 
   after(() => {
     // Never assign to process.env wholesale: that resets every variable
     // (including HOME) and races with other suites' before hooks.
-    for (const key of ["HINDSIGHT_BANK_ID", "HINDSIGHT_SCOPING", "HINDSIGHT_BANK_SCOPE", "HINDSIGHT_BANK_NAMESPACE"] as const) {
+    for (const key of ["HINDSIGHT_BANK_ID", "HINDSIGHT_SCOPING", "HINDSIGHT_BANK_SCOPE", "HINDSIGHT_BANK_NAMESPACE", "HINDSIGHT_RETAIN_TAGS"] as const) {
       if (originalEnv[key] === undefined) delete process.env[key];
       else process.env[key] = originalEnv[key];
     }
@@ -1487,6 +1488,24 @@ describe("applyEnvOverrides", { skip: !extensionDepsInstalled && "extension deps
     const merged = env();
     assert.equal(merged.project_bank_id, undefined);
     assert.equal(merged.global_bank, "shared-global");
+  });
+
+  test("HINDSIGHT_RETAIN_TAGS overrides retain_tags without touching bank routing", () => {
+    process.env.HINDSIGHT_RETAIN_TAGS = "agent:from-env, team:infra";
+    const merged: Record<string, string> = {
+      api_url: "http://x",
+      retain_tags: "agent:from-config",
+      global_bank: "shared-global",
+    };
+    applyEnvOverrides(merged);
+    assert.equal(merged.retain_tags, "agent:from-env, team:infra");
+    assert.equal(merged.project_bank_id, undefined);
+    assert.equal(merged.global_bank, "shared-global");
+  });
+
+  test("retain_tags is untouched without HINDSIGHT_RETAIN_TAGS", () => {
+    const merged = env();
+    assert.equal((merged as Record<string, string>).retain_tags, undefined);
   });
 
   test("overrides the project bank, keeps configured global_bank when scoping is unset", () => {
@@ -1710,7 +1729,7 @@ describe("session bank resolution", { skip: !extensionDepsInstalled && "extensio
   const SID_B = "01a18aa6-cf2c-71a6-8b67-aaaa11112222";
 
   after(() => {
-    for (const key of ["HINDSIGHT_BANK_ID", "HINDSIGHT_SCOPING", "HINDSIGHT_BANK_SCOPE", "HINDSIGHT_BANK_NAMESPACE"] as const) {
+    for (const key of ["HINDSIGHT_BANK_ID", "HINDSIGHT_SCOPING", "HINDSIGHT_BANK_SCOPE", "HINDSIGHT_BANK_NAMESPACE", "HINDSIGHT_RETAIN_TAGS"] as const) {
       delete process.env[key];
     }
   });
